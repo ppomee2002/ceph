@@ -90,6 +90,69 @@ static __u32 crush_hash32_rjenkins1_5(__u32 a, __u32 b, __u32 c, __u32 d,
 }
 
 
+#ifndef __KERNEL__
+
+#define LSH_NUM_HYPERPLANES  32
+#define LSH_MAX_DIM         1024
+
+/*
+ * Deterministic PRNG for hyperplane init (LCG, no external deps).
+ * Seed 1315423911 matches crush_hash_seed for consistency.
+ */
+static float lsh_rand_u01(unsigned int *state)
+{
+	*state = *state * 1103515245u + 12345u;
+	return (float)(*state) / (float)(0xffffffffu) * 2.0f - 1.0f;
+}
+
+static void lsh_init_hyperplanes(float planes[LSH_NUM_HYPERPLANES][LSH_MAX_DIM])
+{
+	unsigned int state = 1315423911u;
+	for (int i = 0; i < LSH_NUM_HYPERPLANES; i++) {
+		for (int j = 0; j < LSH_MAX_DIM; j++) {
+			planes[i][j] = lsh_rand_u01(&state);
+		}
+	}
+}
+
+/*
+ * Sign Random Projection (Cosine LSH): 32 hyperplanes, dot products,
+ * sign bits -> single __u32. Deterministic, no malloc, C99 only.
+ */
+__u32 crush_hash32_lsh(const float *vector, int dim)
+{
+	static float lsh_planes[LSH_NUM_HYPERPLANES][LSH_MAX_DIM];
+	static int lsh_done;
+
+	if (dim <= 0)
+		return 0;
+
+	if (!lsh_done) {
+		lsh_init_hyperplanes(lsh_planes);
+		lsh_done = 1;
+	}
+
+	if (dim > LSH_MAX_DIM)
+		dim = LSH_MAX_DIM;
+
+	__u32 hash = 0;
+	for (int i = 0; i < LSH_NUM_HYPERPLANES; i++) {
+		float dot = 0.0f;
+		const float *v = vector;
+		const float *h = lsh_planes[i];
+		int d = dim;
+
+		while (d--) {
+			dot += *v++ * *h++;
+		}
+
+		hash |= ((dot >= 0.0f) ? 1u : 0u) << i;
+	}
+	return hash;
+}
+
+#endif /* !__KERNEL__ */
+
 __u32 crush_hash32(int type, __u32 a)
 {
 	switch (type) {

@@ -20,4 +20,9 @@ extern __u32 crush_hash32_4(int type, __u32 a, __u32 b, __u32 c, __u32 d);
 extern __u32 crush_hash32_5(int type, __u32 a, __u32 b, __u32 c, __u32 d,
 			    __u32 e);
 
+#ifndef __KERNEL__
+/* Sign Random Projection (Cosine LSH) - embedding vector to 32-bit hash */
+extern __u32 crush_hash32_lsh(const float *vector, int dim);
+#endif
+
 #endif
