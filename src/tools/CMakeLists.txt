@@ -28,6 +28,10 @@ if(NOT WIN32)
   #install(TARGETS neorados DESTINATION bin)
 endif()
 
+add_executable(ceph-vector-bench ceph_vector_bench.cc)
+target_link_libraries(ceph-vector-bench librados global)
+install(TARGETS ceph-vector-bench DESTINATION bin)
+
 if(WITH_TESTS)
 add_executable(ceph_scratchtool scratchtool.c)
 target_link_libraries(ceph_scratchtool librados global)

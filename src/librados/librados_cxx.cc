@@ -2272,6 +2272,13 @@ void librados::IoCtx::locator_set_key(const string& key)
   io_ctx_impl->oloc.key = key;
 }
 
+void librados::IoCtx::locator_set_hash(int64_t hash)
+{
+  io_ctx_impl->oloc.hash = hash;
+  if (hash >= 0)
+    io_ctx_impl->oloc.key.clear();
+}
+
 void librados::IoCtx::set_namespace(const string& nspace)
 {
   io_ctx_impl->oloc.nspace = nspace;

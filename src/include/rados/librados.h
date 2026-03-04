@@ -1044,6 +1044,25 @@ CEPH_RADOS_API void rados_ioctx_locator_set_key(rados_ioctx_t io,
                                                 const char *key);
 
 /**
+ * Set the placement hash for objects within an io context
+ *
+ * When set to a non-negative value, this overrides the default hash
+ * (computed from object name/key via ceph_str_hash) for PG placement.
+ * Use this for vector/embedding data with LSH-based placement: compute
+ * crush_hash32_lsh(embedding, dim) and pass the result here so that
+ * similar vectors map to the same PG.
+ *
+ * Pass -1 to clear and revert to the default name/key-based hashing.
+ * When hash is set, the locator key is cleared (hash and key are mutually
+ * exclusive per object_locator_t semantics).
+ *
+ * @param io the io context to change
+ * @param hash placement hash (0 to 2^32-1), or -1 to use default hashing
+ */
+CEPH_RADOS_API void rados_ioctx_locator_set_hash(rados_ioctx_t io,
+                                                 int64_t hash);
+
+/**
  * Set the namespace for objects within an io context
  *
  * The namespace specification further refines a pool into different

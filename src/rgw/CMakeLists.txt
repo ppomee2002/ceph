@@ -548,6 +548,10 @@ endif()
 # part of radosgw_admin
 if(WITH_RADOSGW_ARROW_FLIGHT)
   target_link_libraries(radosgw-admin ${ARROW_LIBRARIES} ${ARROW_FLIGHT_LIBRARIES})
+  # Parquet has Thrift deps; explicit link required to fix "DSO missing from command line"
+  if(TARGET thrift::libthrift)
+    target_link_libraries(radosgw-admin thrift::libthrift)
+  endif()
 endif(WITH_RADOSGW_ARROW_FLIGHT)
 
 if(WITH_RADOSGW_RADOS)

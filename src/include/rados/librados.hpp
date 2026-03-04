@@ -1353,6 +1353,12 @@ inline namespace v14_2_0 {
     std::string get_pool_name() const;
 
     void locator_set_key(const std::string& key);
+    /**
+     * Set the placement hash for LSH-based vector PG routing.
+     * Pass crush_hash32_lsh(embedding, dim) so similar vectors map
+     * to the same PG. Pass -1 to revert to default name/key hashing.
+     */
+    void locator_set_hash(int64_t hash);
     void set_namespace(const std::string& nspace);
     std::string get_namespace() const;
 

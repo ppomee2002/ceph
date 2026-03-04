@@ -1656,6 +1656,17 @@ extern "C" void LIBRADOS_C_API_DEFAULT_F(rados_ioctx_locator_set_key)(
 }
 LIBRADOS_C_API_BASE_DEFAULT(rados_ioctx_locator_set_key);
 
+extern "C" void LIBRADOS_C_API_DEFAULT_F(rados_ioctx_locator_set_hash)(
+  rados_ioctx_t io,
+  int64_t hash)
+{
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  ctx->oloc.hash = hash;
+  if (hash >= 0)
+    ctx->oloc.key.clear();
+}
+LIBRADOS_C_API_BASE_DEFAULT(rados_ioctx_locator_set_hash);
+
 extern "C" void LIBRADOS_C_API_DEFAULT_F(rados_ioctx_set_namespace)(
   rados_ioctx_t io,
   const char *nspace)

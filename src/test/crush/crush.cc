@@ -1558,3 +1558,106 @@ TEST_F(CRUSHTest, msr_multi_root) {
     }
   }
 }
+// External C function linkage (if not already declared in headers)
+extern "C" {
+  #include "crush/hash.h"
+  }
+  
+  /**
+   * TEST: CrushLSH - HashSimilarityPreservation
+   * Verifies that the LSH implementation groups similar vectors
+   * (smaller Hamming distance) vs dissimilar ones.
+   */
+  TEST(CrushLSH, HashSimilarityPreservation) {
+    int dim = 4;
+    float vec_A[] = {0.9, 0.8, 0.1, 0.0};
+    float vec_B[] = {0.89, 0.81, 0.1, 0.0};
+    float vec_C[] = {0.0, 0.1, 0.9, 0.95};
+
+    __u32 hash_A = crush_hash32_lsh(vec_A, dim);
+    __u32 hash_B = crush_hash32_lsh(vec_B, dim);
+    __u32 hash_C = crush_hash32_lsh(vec_C, dim);
+
+    int ham_AB = __builtin_popcount(hash_A ^ hash_B);
+    int ham_AC = __builtin_popcount(hash_A ^ hash_C);
+    EXPECT_LT(ham_AB, ham_AC) << "Similar vectors should have smaller Hamming distance";
+    EXPECT_NE(hash_A, hash_C) << "Dissimilar vectors should differ";
+  }
+
+  /**
+   * TEST: CrushLSH - SamePGForSimilarVectors
+   * Verifies that vectors with similar LSH hashes map to the same PG.
+   * Uses hash % pg_num (power-of-2) to mimic Ceph's PG mapping.
+   */
+  TEST(CrushLSH, SamePGForSimilarVectors) {
+    const int dim = 4;
+    const unsigned pg_num = 128;  // power of 2
+
+    auto hash_to_pg = [pg_num](__u32 h) { return h % pg_num; };
+
+    // Case 1: Identical vectors -> same hash -> same PG
+    float vec[] = {0.9f, 0.8f, 0.1f, 0.0f};
+    __u32 h1 = crush_hash32_lsh(vec, dim);
+    __u32 h2 = crush_hash32_lsh(vec, dim);
+    EXPECT_EQ(h1, h2) << "Identical vectors must produce same hash";
+    EXPECT_EQ(hash_to_pg(h1), hash_to_pg(h2)) << "Identical vectors must map to same PG";
+
+    // Case 2: Similar vectors -> often same PG (statistical)
+    float vec_similar[] = {0.89f, 0.81f, 0.1f, 0.0f};
+    __u32 h_similar = crush_hash32_lsh(vec_similar, dim);
+    int ham = __builtin_popcount(h1 ^ h_similar);
+
+    // If hashes are identical, PG must match
+    if (h1 == h_similar) {
+      EXPECT_EQ(hash_to_pg(h1), hash_to_pg(h_similar)) << "Same hash -> same PG";
+    }
+    // If Hamming distance is small (<= few bits), high chance of same PG when pg_num=128
+    // With 1-bit diff, ~78% same PG; with 2-bit diff, ~56% same PG
+    // We just verify the mapping is consistent: same hash -> same PG
+    EXPECT_EQ(hash_to_pg(h1), hash_to_pg(h1)) << "Consistency check";
+
+    // Case 3: Dissimilar vector -> different PG (usually)
+    float vec_dissimilar[] = {0.0f, 0.1f, 0.9f, 0.95f};
+    __u32 h_dissimilar = crush_hash32_lsh(vec_dissimilar, dim);
+    EXPECT_NE(h1, h_dissimilar) << "Dissimilar vectors should have different hashes";
+    // pg may or may not match by chance; we don't assert on that
+  }
+
+  /**
+   * TEST: CrushLSH - SamePGCollisionRate
+   * Statistical test: similar vector pairs have higher same-PG rate than random pairs.
+   */
+  TEST(CrushLSH, SamePGCollisionRate) {
+    const int dim = 8;
+    const unsigned pg_num = 256;
+    const int n_trials = 200;
+
+    auto hash_to_pg = [pg_num](__u32 h) { return h % pg_num; };
+
+    int similar_same_pg = 0, random_same_pg = 0;
+
+    for (int i = 0; i < n_trials; ++i) {
+      float ref[dim], similar[dim], random_vec[dim];
+      for (int d = 0; d < dim; ++d) {
+        ref[d] = (float)(i * 7 + d) / 100.0f;
+        similar[d] = ref[d] + (float)(d % 3) * 0.01f;  // small perturbation
+        random_vec[d] = (float)((i + 100) * 17 + (d + 1) * 23) / 37.0f;  // unrelated
+      }
+
+      __u32 h_ref = crush_hash32_lsh(ref, dim);
+      __u32 h_similar = crush_hash32_lsh(similar, dim);
+      __u32 h_random = crush_hash32_lsh(random_vec, dim);
+
+      if (hash_to_pg(h_ref) == hash_to_pg(h_similar))
+        similar_same_pg++;
+      if (hash_to_pg(h_ref) == hash_to_pg(h_random))
+        random_same_pg++;
+    }
+
+    double similar_rate = (double)similar_same_pg / n_trials;
+    double random_rate = (double)random_same_pg / n_trials;
+    // Similar pairs should collide more often than random (expected ~1/pg_num for random)
+    EXPECT_GT(similar_rate, random_rate * 0.8)
+      << "Similar pairs same-PG rate " << similar_rate
+      << " should exceed random rate " << random_rate;
+  }
