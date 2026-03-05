@@ -428,8 +428,8 @@ int main(int argc, const char **argv)
     try {
       for (auto it = ioctx.nobjects_begin(); it != ioctx.nobjects_end(); ++it) {
         std::string oid = it->get_oid();
-        uint32_t pg = hash_to_pg(it.get_pg_hash_position(), pg_num);
-        /* parse OID: vec_00039462 → 39462 */
+
+        /* parse OID: vec_00039462 -> idx */
         size_t idx = 0;
         if (oid.size() > obj_prefix.size()) {
           const char* p = oid.c_str() + obj_prefix.size();
@@ -437,7 +437,11 @@ int main(int argc, const char **argv)
         }
         if (idx >= bn)
           continue;
-        /* fetch from base_vectors in mem */
+
+        /* recompute LSH hash from base_vectors (get_pg_hash_position uses bit-reversed cursor) */
+        __u32 real_lsh_hash = crush_hash32_lsh(base_vectors + idx * bd, bd);
+        uint32_t pg = hash_to_pg(real_lsh_hash, pg_num);
+
         std::vector<float> vec(base_vectors + idx * bd, base_vectors + idx * bd + bd);
         pg_vecs[pg].emplace_back(idx, std::move(vec));
         scan_count++;
