@@ -149,7 +149,7 @@ static void usage(std::ostream& out) {
       << "\n"
       << "Load: Load SIFT/fvecs into Ceph with LSH-based PG placement.\n"
       << "Verify: Measure if similar vectors land in same PG (no Ceph needed).\n"
-      << "Recall: Single-PG Recall vs Ground Truth (requires Ceph + loaded data).\n"
+      << "Recall: LSH Recall vs Ground Truth (single/multi-probe, requires Ceph + loaded data).\n"
       << "\n"
       << "required (load): -f, -p\n"
       << "required (verify): -f, --verify-only\n"
@@ -160,6 +160,7 @@ static void usage(std::ostream& out) {
       << "  -q, --query <file>    query .fvecs for recall (e.g. sift_query.fvecs)\n"
       << "  --verify-only        verify LSH locality, no Ceph connection\n"
       << "  --recall             measure single-PG Recall vs ground truth\n"
+      << "  --probe <M>          max PGs to probe per query (default: 1, multi-probe LSH)\n"
       << "  --pg-num <N>         PG count (default: 256)\n"
       << "  --gt <ivecs>         ground truth (sift_groundtruth.ivecs)\n"
       << "  -n, --num <N>        limit base vectors (0=all)\n"
@@ -190,6 +191,7 @@ int main(int argc, const char **argv)
   bool verify_only = false;
   bool recall_mode = false;
   uint32_t pg_num = 256;
+  uint32_t max_probe = 1;
   std::string gt_file;
 
   std::vector<const char*>::iterator i;
@@ -212,6 +214,9 @@ int main(int argc, const char **argv)
     } else if (ceph_argparse_witharg(args, i, &val, "--pg-num", (char*)nullptr)) {
       pg_num = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
       if (pg_num == 0) pg_num = 256;
+    } else if (ceph_argparse_witharg(args, i, &val, "--probe", (char*)nullptr)) {
+      max_probe = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (max_probe == 0) max_probe = 1;
     } else if (ceph_argparse_witharg(args, i, &val, "--gt", (char*)nullptr)) {
       gt_file = val;
     } else if (ceph_argparse_flag(args, i, "--verify-only", (char*)nullptr)) {
@@ -457,36 +462,49 @@ int main(int argc, const char **argv)
     }
     std::cout << "done: " << scan_count << " objects in " << pg_vecs.size() << " PGs" << std::endl;
 
-    /* Recall@k per query */
+    /* Recall@k, multi-probe */
     double recall_sum = 0;
     size_t valid_queries = 0;
+    size_t probe_pg_sum = 0;
+    size_t cand_sum = 0;
     std::vector<std::pair<float, size_t>> dist_idx;
 
     for (size_t q = 0; q < qn; q++) {
       uint32_t lsh_hash = crush_hash32_lsh(queries + q * qd, qd);
-      uint32_t target_pg = hash_to_pg(lsh_hash, pg_num);
 
-      auto pit = pg_vecs.find(target_pg);
-      if (pit == pg_vecs.end() || pit->second.empty())
+      /* PGs: orig hash + 1-bit flips, dedup, cap at max_probe */
+      std::unordered_set<uint32_t> target_pgs;
+      target_pgs.insert(hash_to_pg(lsh_hash, pg_num));
+      for (int i = 0; i < 32 && target_pgs.size() < max_probe; i++)
+        target_pgs.insert(hash_to_pg(lsh_hash ^ (1u << i), pg_num));
+
+      /* gather cands from target PGs */
+      std::vector<std::pair<size_t, const float*>> all_cands;
+      for (uint32_t pg : target_pgs) {
+        auto pit = pg_vecs.find(pg);
+        if (pit != pg_vecs.end())
+          for (const auto& c : pit->second)
+            all_cands.emplace_back(c.first, c.second.data());
+      }
+      if (all_cands.empty())
         continue;
 
-      const auto& cands = pit->second;
+      probe_pg_sum += target_pgs.size();
+      cand_sum += all_cands.size();
+
       dist_idx.clear();
-      for (const auto& c : cands) {
-        size_t dim = std::min(c.second.size(), qd);
-        float d2 = l2_dist_sq(queries + q * qd, c.second.data(), dim);
+      for (const auto& c : all_cands) {
+        float d2 = l2_dist_sq(queries + q * qd, c.second, static_cast<int>(bd));
         dist_idx.emplace_back(d2, c.first);
       }
       std::partial_sort(dist_idx.begin(),
                         dist_idx.begin() + std::min(gt_k, dist_idx.size()),
                         dist_idx.end());
 
-      /* top-k in this PG */
       std::unordered_set<size_t> pg_topk;
       for (size_t i = 0; i < std::min(gt_k, dist_idx.size()); i++)
         pg_topk.insert(dist_idx[i].second);
 
-      /* hits = |pg_topk ∩ gt_topk| */
       size_t hits = 0;
       for (size_t i = 0; i < gt_k; i++) {
         int ii = gt[q * gt_k + i];
@@ -497,9 +515,13 @@ int main(int argc, const char **argv)
     }
 
     double avg_recall = (valid_queries > 0) ? (100.0 * recall_sum / valid_queries) : 0;
-    std::cout << "\n=== Single-PG Recall (pg_num=" << pg_num << ", k=" << gt_k
-              << ", queries=" << valid_queries << "/" << qn << ") ===\n";
-    std::cout << "  Average Recall@100: " << avg_recall << "%\n";
+    double avg_probe_pgs = (valid_queries > 0) ? (double)probe_pg_sum / valid_queries : 0;
+    double avg_cands = (valid_queries > 0) ? (double)cand_sum / valid_queries : 0;
+    std::cout << "\n=== Recall (pg_num=" << pg_num << ", k=" << gt_k
+              << ", probe=" << max_probe << ", queries=" << valid_queries << "/" << qn << ") ===\n";
+    std::cout << "  Average Recall@" << gt_k << ": " << avg_recall << "%\n";
+    std::cout << "  Avg PGs probed: " << avg_probe_pgs << "\n";
+    std::cout << "  Avg candidates: " << avg_cands << "\n";
 
     delete[] base_vectors;
     delete[] queries;
