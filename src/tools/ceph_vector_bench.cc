@@ -131,6 +131,10 @@ static inline unsigned cbits32(uint32_t v) {
   if (v == 0) return 0;
   return 32 - __builtin_clz(static_cast<unsigned>(v));
 }
+/* LSH bits to match pg_num (e.g. 9 for 512 PGs) - no wasted bits */
+static inline unsigned valid_lsh_bits(uint32_t pg_num) {
+  return (pg_num <= 1) ? 1u : cbits32(pg_num - 1);
+}
 static inline uint32_t hash_to_pg(uint32_t h, uint32_t pg_num) {
   if (pg_num <= 0) return 0;
   uint32_t pg_num_mask = (1u << cbits32(pg_num - 1)) - 1;
@@ -161,7 +165,7 @@ static void usage(std::ostream& out) {
       << "  --verify-only        verify LSH locality, no Ceph connection\n"
       << "  --recall             measure single-PG Recall vs ground truth\n"
       << "  --probe <M>          max PGs to probe per query (default: 1, multi-probe LSH)\n"
-      << "  --pg-num <N>         PG count (default: 256)\n"
+      << "  --pg-num <N>         PG count, sets LSH bits (default: 256). Load: match pool.\n"
       << "  --gt <ivecs>         ground truth (sift_groundtruth.ivecs)\n"
       << "  -n, --num <N>        limit base vectors (0=all)\n"
       << "  -Q, --query-num <N>  limit queries for recall (0=all)\n"
@@ -245,9 +249,10 @@ int main(int argc, const char **argv)
     if (!vectors) return 1;
     if (max_vectors > 0 && n > max_vectors) n = max_vectors;
 
+    unsigned vbits = valid_lsh_bits(pg_num);
     std::vector<uint32_t> lsh(n), pg(n);
     for (size_t i = 0; i < n; i++) {
-      lsh[i] = crush_hash32_lsh(vectors + i * d, d);
+      lsh[i] = crush_hash32_lsh_n(vectors + i * d, d, vbits);
       pg[i] = hash_to_pg(lsh[i], pg_num);
     }
 
@@ -293,7 +298,7 @@ int main(int argc, const char **argv)
     double inter_avg = (inter_count > 0) ? (inter_sum / inter_count) : 0;
 
     std::cout << "=== LSH Locality Verification (n=" << n << ", dim=" << d
-              << ", pg_num=" << pg_num << ") ===\n";
+              << ", pg_num=" << pg_num << ", lsh_bits=" << vbits << ") ===\n";
     std::cout << "  intra-PG avg L2 distance: " << intra_avg << "\n";
     std::cout << "  inter-PG avg L2 distance: " << inter_avg << "\n";
     std::cout << "  ratio (inter/intra):      " << (intra_avg > 0 ? inter_avg / intra_avg : 0)
@@ -404,7 +409,7 @@ int main(int argc, const char **argv)
     {
       char first_oid[256];
       snprintf(first_oid, sizeof(first_oid), "%s%08zu", obj_prefix.c_str(), (size_t)0);
-      __u32 lsh0 = crush_hash32_lsh(base_vectors, bd);
+      __u32 lsh0 = crush_hash32_lsh_n(base_vectors, bd, valid_lsh_bits(pg_num));
       IoCtx verify_ctx;
       if (rados.ioctx_create(pool_name.c_str(), verify_ctx) == 0) {
         verify_ctx.locator_set_hash(static_cast<int64_t>(lsh0));
@@ -444,7 +449,7 @@ int main(int argc, const char **argv)
           continue;
 
         /* recompute LSH hash from base_vectors (get_pg_hash_position uses bit-reversed cursor) */
-        __u32 real_lsh_hash = crush_hash32_lsh(base_vectors + idx * bd, bd);
+        __u32 real_lsh_hash = crush_hash32_lsh_n(base_vectors + idx * bd, bd, valid_lsh_bits(pg_num));
         uint32_t pg = hash_to_pg(real_lsh_hash, pg_num);
 
         std::vector<float> vec(base_vectors + idx * bd, base_vectors + idx * bd + bd);
@@ -469,14 +474,29 @@ int main(int argc, const char **argv)
     size_t cand_sum = 0;
     std::vector<std::pair<float, size_t>> dist_idx;
 
+    unsigned vbits = valid_lsh_bits(pg_num);
     for (size_t q = 0; q < qn; q++) {
-      uint32_t lsh_hash = crush_hash32_lsh(queries + q * qd, qd);
+      uint32_t lsh_hash = crush_hash32_lsh_n(queries + q * qd, qd, vbits);
 
-      /* PGs: orig hash + 1-bit flips, dedup, cap at max_probe */
+      /* PGs: orig + hd=1,2,3.. bit-flips until max_probe (within vbits) */
       std::unordered_set<uint32_t> target_pgs;
       target_pgs.insert(hash_to_pg(lsh_hash, pg_num));
-      for (int i = 0; i < 32 && target_pgs.size() < max_probe; i++)
-        target_pgs.insert(hash_to_pg(lsh_hash ^ (1u << i), pg_num));
+      for (int hd = 1; hd <= static_cast<int>(vbits) && target_pgs.size() < max_probe; hd++) {
+        std::vector<int> bits(hd);
+        for (int i = 0; i < hd; i++) bits[i] = i;
+        do {
+          uint32_t h = lsh_hash;
+          for (int b : bits) h ^= (1u << b);
+          target_pgs.insert(hash_to_pg(h, pg_num));
+          if (target_pgs.size() >= max_probe) break;
+          /* next k-comb of [0..vbits-1] */
+          int i = hd - 1;
+          while (i >= 0 && bits[i] == static_cast<int>(vbits) - hd + i) i--;
+          if (i < 0) break;
+          bits[i]++;
+          for (int j = i + 1; j < hd; j++) bits[j] = bits[j - 1] + 1;
+        } while (true);
+      }
 
       /* gather cands from target PGs */
       std::vector<std::pair<size_t, const float*>> all_cands;
@@ -517,8 +537,9 @@ int main(int argc, const char **argv)
     double avg_recall = (valid_queries > 0) ? (100.0 * recall_sum / valid_queries) : 0;
     double avg_probe_pgs = (valid_queries > 0) ? (double)probe_pg_sum / valid_queries : 0;
     double avg_cands = (valid_queries > 0) ? (double)cand_sum / valid_queries : 0;
-    std::cout << "\n=== Recall (pg_num=" << pg_num << ", k=" << gt_k
-              << ", probe=" << max_probe << ", queries=" << valid_queries << "/" << qn << ") ===\n";
+    std::cout << "\n=== Recall (pg_num=" << pg_num << ", lsh_bits=" << vbits
+              << ", k=" << gt_k << ", probe=" << max_probe
+              << ", queries=" << valid_queries << "/" << qn << ") ===\n";
     std::cout << "  Average Recall@" << gt_k << ": " << avg_recall << "%\n";
     std::cout << "  Avg PGs probed: " << avg_probe_pgs << "\n";
     std::cout << "  Avg candidates: " << avg_cands << "\n";
@@ -578,7 +599,8 @@ int main(int argc, const char **argv)
   std::vector<librados::AioCompletion*> comp_pool(concurrency);
 
   std::cout << "loading " << n << " vectors (dim=" << d << ") from " << fvecs_file
-            << " -> pool " << pool_name << " (concurrency=" << concurrency << ")"
+            << " -> pool " << pool_name << " (pg_num=" << pg_num
+            << ", lsh_bits=" << valid_lsh_bits(pg_num) << ", concurrency=" << concurrency << ")"
             << std::endl;
 
   auto t0 = std::chrono::steady_clock::now();
@@ -593,7 +615,7 @@ int main(int argc, const char **argv)
     for (size_t j = 0; j < batch; j++) {
       size_t i = offset + j;
       float* vec = vectors + i * d;
-      __u32 lsh_hash = crush_hash32_lsh(vec, d);
+      __u32 lsh_hash = crush_hash32_lsh_n(vec, d, valid_lsh_bits(pg_num));
 
       ioctx.locator_set_hash(static_cast<int64_t>(lsh_hash));
 
