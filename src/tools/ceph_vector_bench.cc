@@ -3,14 +3,15 @@
 /*
  * Ceph - scalable distributed file system
  *
- * SIFT .fvecs → LSH PG placement → Ceph pool loader/verifier
+ * Vector benchmark: SIFT .fvecs loader with LSH-based PG placement,
+ * locality verification, and Recall@k measurement.
  *
  * Usage:
  *   ceph-vector-bench -f sift_base.fvecs -p vector_pool [options]
  *   ceph-vector-bench -f sift_base.fvecs --verify-only --pg-num 256 [options]
  *   ceph-vector-bench --recall -p vector_pool -q sift_query.fvecs --gt sift_groundtruth.ivecs --pg-num 128
  *
- * .fvecs: 4B dim + dim*4B floats per vector (ANN standard)
+ * Format: .fvecs = 4B dim + dim*4B floats per vector (ANN benchmark standard)
  */
 
 #include "include/rados/librados.hpp"
@@ -35,13 +36,14 @@ extern "C" {
 #include <fstream>
 #include <string>
 #include <algorithm>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 using namespace librados;
 
-/* Load fvecs. [4B dim][dim*4B floats] per vector. Returns new[] - caller frees. */
+/** Read fvecs format: [4B dim][dim*4B floats] per vector. Caller must free with delete[]. */
 static float* fvecs_read(const char* fname, size_t* d_out, size_t* n_out) {
   std::ifstream f(fname, std::ios::binary);
   if (!f) {
@@ -79,7 +81,7 @@ static float* fvecs_read(const char* fname, size_t* d_out, size_t* n_out) {
   return x;
 }
 
-/* Load ivecs (SIFT GT). Row i = k NN indices. Returns new[] - caller frees. */
+/** Read ivecs ground truth: each row = k nearest-neighbor indices. Caller must free with delete[]. */
 static int* ivecs_read(const char* fname, size_t* k_out, size_t* n_out) {
   std::ifstream f(fname, std::ios::binary);
   if (!f) {
@@ -112,7 +114,7 @@ static int* ivecs_read(const char* fname, size_t* k_out, size_t* n_out) {
   return gt;
 }
 
-/* L2^2 - skip sqrt for ordering */
+/** Squared L2 distance; omit sqrt since ordering is preserved. */
 static float l2_dist_sq(const float* a, const float* b, int dim) {
   float sum = 0;
   for (int i = 0; i < dim; i++) {
@@ -126,12 +128,12 @@ static float l2_dist(const float* a, const float* b, int dim) {
   return sqrtf(l2_dist_sq(a, b, dim));
 }
 
-/* Ceph stable_mod - matches raw_hash_to_pg() */
+/** Leading one bit position; used for Ceph stable_mod / raw_hash_to_pg. */
 static inline unsigned cbits32(uint32_t v) {
   if (v == 0) return 0;
   return 32 - __builtin_clz(static_cast<unsigned>(v));
 }
-/* LSH bits to match pg_num (e.g. 9 for 512 PGs) - no wasted bits */
+/** LSH bit width aligned to pg_num (e.g. 9 bits for 512 PGs). */
 static inline unsigned valid_lsh_bits(uint32_t pg_num) {
   return (pg_num <= 1) ? 1u : cbits32(pg_num - 1);
 }
@@ -153,7 +155,7 @@ static void usage(std::ostream& out) {
       << "\n"
       << "Load: Load SIFT/fvecs into Ceph with LSH-based PG placement.\n"
       << "Verify: Measure if similar vectors land in same PG (no Ceph needed).\n"
-      << "Recall: LSH Recall vs Ground Truth (single/multi-probe, requires Ceph + loaded data).\n"
+      << "Recall: LSH Recall vs Ground Truth (multi-table Fan-out, requires Ceph + loaded data).\n"
       << "\n"
       << "required (load): -f, -p\n"
       << "required (verify): -f, --verify-only\n"
@@ -164,13 +166,15 @@ static void usage(std::ostream& out) {
       << "  -q, --query <file>    query .fvecs for recall (e.g. sift_query.fvecs)\n"
       << "  --verify-only        verify LSH locality, no Ceph connection\n"
       << "  --recall             measure single-PG Recall vs ground truth\n"
-      << "  --probe <M>          max PGs to probe per query (default: 1, multi-probe LSH)\n"
+      << "  --num-tables <N>     LSH tables for Fan-out (default: 128). Load/Recall.\n"
       << "  --pg-num <N>         PG count, sets LSH bits (default: 256). Load: match pool.\n"
       << "  --gt <ivecs>         ground truth (sift_groundtruth.ivecs)\n"
       << "  -n, --num <N>        limit base vectors (0=all)\n"
       << "  -Q, --query-num <N>  limit queries for recall (0=all)\n"
       << "  -o, --object-prefix  object prefix (default: vec_)\n"
-      << "  -C, --create-pool    create pool (load)\n";
+      << "  -C, --create-pool    create pool (load)\n"
+      << "  --probe-mode <m>     recall: union|vote (default: union)\n"
+      << "  --probe-pgs <N>      recall: top-N PGs in vote mode (default: 1)\n";
 }
 
 int main(int argc, const char **argv)
@@ -195,7 +199,9 @@ int main(int argc, const char **argv)
   bool verify_only = false;
   bool recall_mode = false;
   uint32_t pg_num = 256;
-  uint32_t max_probe = 1;
+  uint32_t num_tables = 128;
+  std::string probe_mode = "union";
+  uint32_t probe_pgs = 1;
   std::string gt_file;
 
   std::vector<const char*>::iterator i;
@@ -218,9 +224,15 @@ int main(int argc, const char **argv)
     } else if (ceph_argparse_witharg(args, i, &val, "--pg-num", (char*)nullptr)) {
       pg_num = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
       if (pg_num == 0) pg_num = 256;
-    } else if (ceph_argparse_witharg(args, i, &val, "--probe", (char*)nullptr)) {
-      max_probe = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
-      if (max_probe == 0) max_probe = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--num-tables", (char*)nullptr)) {
+      num_tables = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (num_tables == 0) num_tables = 128;
+    } else if (ceph_argparse_witharg(args, i, &val, "--probe-mode", (char*)nullptr)) {
+      probe_mode = val;
+      if (probe_mode != "union" && probe_mode != "vote") probe_mode = "union";
+    } else if (ceph_argparse_witharg(args, i, &val, "--probe-pgs", (char*)nullptr)) {
+      probe_pgs = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (probe_pgs == 0) probe_pgs = 1;
     } else if (ceph_argparse_witharg(args, i, &val, "--gt", (char*)nullptr)) {
       gt_file = val;
     } else if (ceph_argparse_flag(args, i, "--verify-only", (char*)nullptr)) {
@@ -237,7 +249,7 @@ int main(int argc, const char **argv)
     }
   }
 
-  /* verify-only: LSH locality check (no Ceph) */
+  /* --- verify-only: LSH locality validation (no cluster required) --- */
   if (verify_only) {
     srand(static_cast<unsigned>(time(nullptr)));
     if (fvecs_file.empty()) {
@@ -256,7 +268,7 @@ int main(int argc, const char **argv)
       pg[i] = hash_to_pg(lsh[i], pg_num);
     }
 
-    /* intra-PG vs inter-PG avg L2 distance */
+    /* Sample intra-PG and inter-PG L2 distances. */
     const size_t intra_samples = 50000;
     const size_t inter_samples = 50000;
     std::unordered_map<uint32_t, std::vector<size_t>> pg_to_idx;
@@ -304,12 +316,12 @@ int main(int argc, const char **argv)
     std::cout << "  ratio (inter/intra):      " << (intra_avg > 0 ? inter_avg / intra_avg : 0)
               << "  (expect > 1 if LSH groups similar vectors)\n";
 
-    /* NN same-PG pair rate: GT k-NN pairs that land in same PG */
+    /* GT k-NN pair colocation: fraction of NN pairs falling in same PG. */
     if (!gt_file.empty()) {
       size_t gt_k, gt_n;
       int* gt = ivecs_read(gt_file.c_str(), &gt_k, &gt_n);
       if (gt) {
-        /* gt indices → base vectors (0..n-1) */
+        /* gt indices map to base vector IDs in [0, n-1]. */
         size_t same_pairs = 0, total_pairs = 0;
         for (size_t q = 0; q < gt_n; q++) {
           for (size_t i = 0; i < gt_k; i++) {
@@ -337,7 +349,7 @@ int main(int argc, const char **argv)
     return 0;
   }
 
-  /* recall: pool scan → single-PG Recall@k vs GT */
+  /* --- recall: pool scan + multi-table fan-out Recall@k vs ground truth --- */
   if (recall_mode) {
     if (pool_name.empty() || query_file.empty() || gt_file.empty() || fvecs_file.empty()) {
       std::cerr << "error: --recall requires -p, -q (--query), --gt, -f (base .fvecs)\n";
@@ -405,31 +417,7 @@ int main(int argc, const char **argv)
       delete[] gt;
       return 1;
     }
-    /* sanity: compare vec_0 from Ceph vs base file */
-    {
-      char first_oid[256];
-      snprintf(first_oid, sizeof(first_oid), "%s%08zu", obj_prefix.c_str(), (size_t)0);
-      __u32 lsh0 = crush_hash32_lsh_n(base_vectors, bd, valid_lsh_bits(pg_num));
-      IoCtx verify_ctx;
-      if (rados.ioctx_create(pool_name.c_str(), verify_ctx) == 0) {
-        verify_ctx.locator_set_hash(static_cast<int64_t>(lsh0));
-        librados::bufferlist vbl;
-        ret = verify_ctx.read(first_oid, vbl, 0, 0);
-        if (ret > 0 && (size_t)ret >= 5 * sizeof(float)) {
-          const float* ceph_vec = reinterpret_cast<const float*>(vbl.c_str());
-          std::cout << "[Ceph read] vec_00000000 first 5 floats: "
-                    << ceph_vec[0] << ", " << ceph_vec[1] << ", " << ceph_vec[2]
-                    << ", " << ceph_vec[3] << ", " << ceph_vec[4] << std::endl;
-          std::cout << "[base file] first 5 floats: "
-                    << base_vectors[0] << ", " << base_vectors[1] << ", " << base_vectors[2]
-                    << ", " << base_vectors[3] << ", " << base_vectors[4] << std::endl;
-        } else {
-          std::cout << "[Ceph read] vec_00000000 read failed or too short (ret=" << ret << ")" << std::endl;
-        }
-      }
-    }
-
-    /* full pool scan → pg_vecs[pg] = (idx, vec). Use base_vectors in mem, not Ceph read. */
+    /* Full pool scan; populate pg_vecs from base_vectors (no Ceph object reads). */
     std::unordered_map<uint32_t, std::vector<std::pair<size_t, std::vector<float>>>> pg_vecs;
     ioctx.set_namespace(all_nspaces);
     std::cout << "scanning pool '" << pool_name << "' (id=" << ioctx.get_id() << ") ..."
@@ -439,18 +427,21 @@ int main(int argc, const char **argv)
       for (auto it = ioctx.nobjects_begin(); it != ioctx.nobjects_end(); ++it) {
         std::string oid = it->get_oid();
 
-        /* parse OID: vec_00039462 -> idx */
+        /* Parse Fan-out OID: vec_<idx>_pg<pg_id> -> (idx, pg). */
         size_t idx = 0;
+        uint32_t pg = 0;
         if (oid.size() > obj_prefix.size()) {
           const char* p = oid.c_str() + obj_prefix.size();
-          idx = strtoull(p, nullptr, 10);
+          char* end = nullptr;
+          idx = strtoull(p, &end, 10);
+          if (end && end[0] == '_' && end[1] == 'p' && end[2] == 'g') {
+            pg = static_cast<uint32_t>(strtoul(end + 3, nullptr, 10));
+          } else {
+            continue;  /* Non-fan-out OID; skip. */
+          }
         }
         if (idx >= bn)
           continue;
-
-        /* recompute LSH hash from base_vectors (get_pg_hash_position uses bit-reversed cursor) */
-        __u32 real_lsh_hash = crush_hash32_lsh_n(base_vectors + idx * bd, bd, valid_lsh_bits(pg_num));
-        uint32_t pg = hash_to_pg(real_lsh_hash, pg_num);
 
         std::vector<float> vec(base_vectors + idx * bd, base_vectors + idx * bd + bd);
         pg_vecs[pg].emplace_back(idx, std::move(vec));
@@ -467,50 +458,61 @@ int main(int argc, const char **argv)
     }
     std::cout << "done: " << scan_count << " objects in " << pg_vecs.size() << " PGs" << std::endl;
 
-    /* Recall@k, multi-probe */
+    /* Recall@k via union or vote-based probing. */
     double recall_sum = 0;
     size_t valid_queries = 0;
     size_t probe_pg_sum = 0;
     size_t cand_sum = 0;
+    double best_vote_sum = 0;
+    double vote_concentration_sum = 0;
     std::vector<std::pair<float, size_t>> dist_idx;
 
-    unsigned vbits = valid_lsh_bits(pg_num);
+    auto recall_t0 = std::chrono::steady_clock::now();
     for (size_t q = 0; q < qn; q++) {
-      uint32_t lsh_hash = crush_hash32_lsh_n(queries + q * qd, qd, vbits);
-
-      /* PGs: orig + hd=1,2,3.. bit-flips until max_probe (within vbits) */
-      std::unordered_set<uint32_t> target_pgs;
-      target_pgs.insert(hash_to_pg(lsh_hash, pg_num));
-      for (int hd = 1; hd <= static_cast<int>(vbits) && target_pgs.size() < max_probe; hd++) {
-        std::vector<int> bits(hd);
-        for (int i = 0; i < hd; i++) bits[i] = i;
-        do {
-          uint32_t h = lsh_hash;
-          for (int b : bits) h ^= (1u << b);
-          target_pgs.insert(hash_to_pg(h, pg_num));
-          if (target_pgs.size() >= max_probe) break;
-          /* next k-comb of [0..vbits-1] */
-          int i = hd - 1;
-          while (i >= 0 && bits[i] == static_cast<int>(vbits) - hd + i) i--;
-          if (i < 0) break;
-          bits[i]++;
-          for (int j = i + 1; j < hd; j++) bits[j] = bits[j - 1] + 1;
-        } while (true);
+      /* Accumulate PG vote counts across LSH tables. */
+      std::unordered_map<uint32_t, size_t> pg_votes;
+      for (uint32_t t = 0; t < num_tables; t++) {
+        __u32 raw_hash = crush_hash32_lsh_multi(queries + q * qd, static_cast<int>(qd), static_cast<int>(t));
+        uint32_t pg = hash_to_pg(raw_hash, pg_num);
+        pg_votes[pg]++;
       }
 
-      /* gather cands from target PGs */
-      std::vector<std::pair<size_t, const float*>> all_cands;
+      /* Target PGs: union=all; vote=top probe_pgs by vote desc, pg asc. */
+      std::vector<uint32_t> target_pgs;
+      double this_best_vote = 0, this_concentration = 0;
+      if (probe_mode == "vote") {
+        std::vector<std::pair<uint32_t, size_t>> ranked(pg_votes.begin(), pg_votes.end());
+        std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+          if (a.second != b.second) return a.second > b.second;
+          return a.first < b.first;
+        });
+        for (size_t i = 0; i < ranked.size() && i < probe_pgs; i++)
+          target_pgs.push_back(ranked[i].first);
+        if (!ranked.empty()) {
+          this_best_vote = ranked[0].second;
+          this_concentration = (double)ranked[0].second / num_tables;
+        }
+      } else {
+        for (const auto& kv : pg_votes)
+          target_pgs.push_back(kv.first);
+      }
+
+      /* Collect candidates from target PGs; dedupe by vec idx (multi-PG overlap). */
+      std::unordered_map<size_t, const float*> cand_dedup;
       for (uint32_t pg : target_pgs) {
         auto pit = pg_vecs.find(pg);
         if (pit != pg_vecs.end())
           for (const auto& c : pit->second)
-            all_cands.emplace_back(c.first, c.second.data());
+            cand_dedup[c.first] = c.second.data();
       }
+      std::vector<std::pair<size_t, const float*>> all_cands(cand_dedup.begin(), cand_dedup.end());
       if (all_cands.empty())
         continue;
 
       probe_pg_sum += target_pgs.size();
       cand_sum += all_cands.size();
+      best_vote_sum += this_best_vote;
+      vote_concentration_sum += this_concentration;
 
       dist_idx.clear();
       for (const auto& c : all_cands) {
@@ -533,16 +535,32 @@ int main(int argc, const char **argv)
       recall_sum += (gt_k > 0) ? (double)hits / gt_k : 0;
       valid_queries++;
     }
+    auto recall_t1 = std::chrono::steady_clock::now();
+    double recall_sec = std::chrono::duration<double>(recall_t1 - recall_t0).count();
 
     double avg_recall = (valid_queries > 0) ? (100.0 * recall_sum / valid_queries) : 0;
     double avg_probe_pgs = (valid_queries > 0) ? (double)probe_pg_sum / valid_queries : 0;
     double avg_cands = (valid_queries > 0) ? (double)cand_sum / valid_queries : 0;
-    std::cout << "\n=== Recall (pg_num=" << pg_num << ", lsh_bits=" << vbits
-              << ", k=" << gt_k << ", probe=" << max_probe
-              << ", queries=" << valid_queries << "/" << qn << ") ===\n";
+    double latency_ms = (valid_queries > 0 && recall_sec > 0) ? (recall_sec * 1000.0 / valid_queries) : 0;
+    double qps = (recall_sec > 0) ? (valid_queries / recall_sec) : 0;
+    double search_space_pct = (bn > 0 && avg_cands > 0) ? (100.0 * avg_cands / bn) : 0;
+
+    double avg_best_vote = (valid_queries > 0) ? (best_vote_sum / valid_queries) : 0;
+    double avg_concentration = (valid_queries > 0) ? (100.0 * vote_concentration_sum / valid_queries) : 0;
+
+    std::cout << "\n=== Recall (pg_num=" << pg_num << ", num_tables=" << num_tables
+              << ", k=" << gt_k << ", queries=" << valid_queries << "/" << qn << ") ===\n";
     std::cout << "  Average Recall@" << gt_k << ": " << avg_recall << "%\n";
+    std::cout << "  Probe mode: " << probe_mode << ", probe_pgs=" << probe_pgs << "\n";
     std::cout << "  Avg PGs probed: " << avg_probe_pgs << "\n";
     std::cout << "  Avg candidates: " << avg_cands << "\n";
+    if (probe_mode == "vote") {
+      std::cout << "  Avg best vote: " << avg_best_vote << ", vote concentration: " << avg_concentration << "%\n";
+    }
+    std::cout << "\n=== Query Performance ===\n";
+    std::cout << "  Latency (avg):  " << latency_ms << " ms/query\n";
+    std::cout << "  QPS:            " << qps << " queries/s\n";
+    std::cout << "  Search space:   " << search_space_pct << "% of base (" << avg_cands << " / " << bn << ")\n";
 
     delete[] base_vectors;
     delete[] queries;
@@ -594,40 +612,61 @@ int main(int argc, const char **argv)
     n = max_vectors;
   }
 
+  /* Fan-out: build write plan (vec_idx, pg_id, hash) per object. */
+  struct WriteOp { size_t vec_idx; uint32_t pg_id; int64_t hash; };
+  std::vector<WriteOp> all_ops;
+  std::unordered_map<uint32_t, size_t> pg_distribution;  /* pg_id -> object count */
+  all_ops.reserve(n * num_tables);  /* worst-case: one write per table per vector */
+
+  for (size_t i = 0; i < n; i++) {
+    float* vec = vectors + i * d;
+    std::unordered_map<uint32_t, int64_t> pg_to_hash;
+    for (uint32_t t = 0; t < num_tables; t++) {
+      __u32 raw_hash = crush_hash32_lsh_multi(vec, static_cast<int>(d), static_cast<int>(t));
+      uint32_t pg_id = hash_to_pg(raw_hash, pg_num);
+      pg_to_hash[pg_id] = static_cast<int64_t>(raw_hash);
+    }
+    for (const auto& kv : pg_to_hash) {
+      all_ops.push_back({i, kv.first, kv.second});
+      pg_distribution[kv.first]++;
+    }
+  }
+
   const size_t concurrency = 128;
   std::vector<librados::bufferlist> bl_pool(concurrency);
   std::vector<librados::AioCompletion*> comp_pool(concurrency);
 
   std::cout << "loading " << n << " vectors (dim=" << d << ") from " << fvecs_file
             << " -> pool " << pool_name << " (pg_num=" << pg_num
-            << ", lsh_bits=" << valid_lsh_bits(pg_num) << ", concurrency=" << concurrency << ")"
+            << ", num_tables=" << num_tables << ", fan-out writes=" << all_ops.size()
+            << ", concurrency=" << concurrency << ")"
             << std::endl;
 
   auto t0 = std::chrono::steady_clock::now();
   size_t written = 0;
-  size_t report_interval = std::max<size_t>(1, n / 20);
+  size_t report_interval = std::max<size_t>(1, all_ops.size() / 20);
   size_t last_report = 0;
 
-  for (size_t offset = 0; offset < n; offset += concurrency) {
-    size_t batch = std::min(concurrency, n - offset);
+  for (size_t offset = 0; offset < all_ops.size(); offset += concurrency) {
+    size_t batch = std::min(concurrency, all_ops.size() - offset);
     for (size_t k = 0; k < batch; k++)
       comp_pool[k] = rados.aio_create_completion();
     for (size_t j = 0; j < batch; j++) {
-      size_t i = offset + j;
-      float* vec = vectors + i * d;
-      __u32 lsh_hash = crush_hash32_lsh_n(vec, d, valid_lsh_bits(pg_num));
+      const WriteOp& op = all_ops[offset + j];
+      float* vec = vectors + op.vec_idx * d;
 
-      ioctx.locator_set_hash(static_cast<int64_t>(lsh_hash));
+      ioctx.locator_set_hash(op.hash);
 
       char oid[256];
-      snprintf(oid, sizeof(oid), "%s%08zu", obj_prefix.c_str(), i);
+      snprintf(oid, sizeof(oid), "%s%08zu_pg%u", obj_prefix.c_str(), op.vec_idx, op.pg_id);
 
       bl_pool[j].clear();
       bl_pool[j].append(reinterpret_cast<const char*>(vec), d * sizeof(float));
 
       ret = ioctx.aio_write_full(oid, comp_pool[j], bl_pool[j]);
       if (ret < 0) {
-        std::cerr << "aio_write_full failed at vec " << i << ": " << cpp_strerror(ret) << std::endl;
+        std::cerr << "aio_write_full failed at vec " << op.vec_idx << " pg " << op.pg_id
+                  << ": " << cpp_strerror(ret) << std::endl;
         for (size_t k = 0; k < batch; k++)
           comp_pool[k]->release();
         delete[] vectors;
@@ -639,7 +678,9 @@ int main(int argc, const char **argv)
       ret = comp_pool[j]->get_return_value();
       comp_pool[j]->release();
       if (ret < 0) {
-        std::cerr << "write failed at vec " << (offset + j) << ": " << cpp_strerror(ret) << std::endl;
+        const WriteOp& op = all_ops[offset + j];
+        std::cerr << "write failed at vec " << op.vec_idx << " pg " << op.pg_id
+                  << ": " << cpp_strerror(ret) << std::endl;
         for (size_t k = j + 1; k < batch; k++)
           comp_pool[k]->release();
         delete[] vectors;
@@ -650,13 +691,13 @@ int main(int argc, const char **argv)
     ioctx.locator_set_hash(-1);
 
     size_t done = offset + batch;
-    if (done - last_report >= report_interval || done == n) {
+    if (done - last_report >= report_interval || done == all_ops.size()) {
       last_report = done;
       auto t1 = std::chrono::steady_clock::now();
       double sec = std::chrono::duration<double>(t1 - t0).count();
       double rate = done / sec;
-      std::cout << "  " << done << "/" << n << " (" << (100 * done / n) << "%) "
-                << rate << " vec/s" << std::endl;
+      std::cout << "  " << done << "/" << all_ops.size() << " writes (" << (100 * done / all_ops.size()) << "%) "
+                << rate << " write/s" << std::endl;
     }
   }
 
@@ -664,8 +705,31 @@ int main(int argc, const char **argv)
 
   auto t1 = std::chrono::steady_clock::now();
   double sec = std::chrono::duration<double>(t1 - t0).count();
-  std::cout << "done: " << written << " vectors in " << sec << "s ("
-            << (written / sec) << " vec/s)" << std::endl;
+  std::cout << "done: " << written << " fan-out writes (" << n << " vectors) in " << sec << "s ("
+            << (written / sec) << " write/s)" << std::endl;
+
+  /* PG occupancy and storage overhead stats. */
+  size_t total_objects = all_ops.size();
+  size_t pg_count = pg_distribution.size();
+  size_t min_per_pg = total_objects, max_per_pg = 0;
+  size_t sum_per_pg = 0;
+  for (const auto& kv : pg_distribution) {
+    size_t c = kv.second;
+    if (c < min_per_pg) min_per_pg = c;
+    if (c > max_per_pg) max_per_pg = c;
+    sum_per_pg += c;
+  }
+  if (pg_count > 0) {
+    double avg_per_pg = (double)sum_per_pg / pg_count;
+    double storage_overhead = (n > 0) ? (double)total_objects / n : 0;
+    std::cout << "\n=== Storage Statistics ===\n";
+    std::cout << "  Total objects (fan-out): " << total_objects << "\n";
+    std::cout << "  Unique vectors:         " << n << "\n";
+    std::cout << "  Storage overhead:       " << storage_overhead << "x (objects/vectors)\n";
+    std::cout << "  PGs used:               " << pg_count << " / " << pg_num << "\n";
+    std::cout << "  Objects per PG: min=" << min_per_pg << ", max=" << max_per_pg
+              << ", avg=" << avg_per_pg << "\n";
+  }
 
   return 0;
 }
