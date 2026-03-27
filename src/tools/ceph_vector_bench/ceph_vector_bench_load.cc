@@ -16,6 +16,7 @@ extern "C" {
 
 #include <chrono>
 #include <cstdio>
+#include <algorithm>
 #include <iostream>
 #include <unordered_map>
 #include <vector>
@@ -65,18 +66,34 @@ int run_vector_bench_load(const VectorBenchOptions& opt) {
   std::vector<WriteOp> all_ops;
   std::unordered_map<uint32_t, size_t> pg_distribution;
   all_ops.reserve(n * opt.num_tables);
+  size_t selected_pg_total = 0;
 
   for (size_t i = 0; i < n; i++) {
     float* vec = vectors + i * d;
+    std::unordered_map<uint32_t, size_t> pg_votes;
     std::unordered_map<uint32_t, int64_t> pg_to_hash;
     for (uint32_t t = 0; t < opt.num_tables; t++) {
       __u32 raw_hash = crush_hash32_lsh_multi(vec, static_cast<int>(d), static_cast<int>(t));
       uint32_t pg_id = hash_to_pg(raw_hash, opt.pg_num);
-      pg_to_hash[pg_id] = static_cast<int64_t>(raw_hash);
+      pg_votes[pg_id]++;
+      if (pg_to_hash.find(pg_id) == pg_to_hash.end())
+        pg_to_hash[pg_id] = static_cast<int64_t>(raw_hash);
     }
-    for (const auto& kv : pg_to_hash) {
-      all_ops.push_back({i, kv.first, kv.second});
-      pg_distribution[kv.first]++;
+
+    std::vector<std::pair<uint32_t, size_t>> ranked(pg_votes.begin(), pg_votes.end());
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+      if (a.second != b.second) return a.second > b.second;
+      return a.first < b.first;
+    });
+    size_t keep_n = ranked.size();
+    if (opt.write_top_pgs > 0)
+      keep_n = std::min<size_t>(keep_n, opt.write_top_pgs);
+    selected_pg_total += keep_n;
+
+    for (size_t r = 0; r < keep_n; r++) {
+      uint32_t pg_id = ranked[r].first;
+      all_ops.push_back({i, pg_id, pg_to_hash[pg_id]});
+      pg_distribution[pg_id]++;
     }
   }
 
@@ -86,7 +103,8 @@ int run_vector_bench_load(const VectorBenchOptions& opt) {
 
   std::cout << "loading " << n << " vectors (dim=" << d << ") from " << opt.fvecs_file
             << " -> pool " << opt.pool_name << " (pg_num=" << opt.pg_num
-            << ", num_tables=" << opt.num_tables << ", fan-out writes=" << all_ops.size()
+            << ", num_tables=" << opt.num_tables << ", write_top_pgs=" << opt.write_top_pgs
+            << ", fan-out writes=" << all_ops.size()
             << ", concurrency=" << concurrency << ")"
             << std::endl;
 
@@ -169,9 +187,11 @@ int run_vector_bench_load(const VectorBenchOptions& opt) {
   if (pg_count > 0) {
     double avg_per_pg = (double)sum_per_pg / pg_count;
     double storage_overhead = (n > 0) ? (double)total_objects / n : 0;
+    double avg_selected_pgs = (n > 0) ? (double)selected_pg_total / n : 0;
     std::cout << "\n=== Storage Statistics ===\n";
     std::cout << "  Total objects (fan-out): " << total_objects << "\n";
     std::cout << "  Unique vectors:         " << n << "\n";
+    std::cout << "  Avg selected PGs/vec:   " << avg_selected_pgs << "\n";
     std::cout << "  Storage overhead:       " << storage_overhead << "x (objects/vectors)\n";
     std::cout << "  PGs used:               " << pg_count << " / " << opt.pg_num << "\n";
     std::cout << "  Objects per PG: min=" << min_per_pg << ", max=" << max_per_pg

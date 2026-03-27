@@ -28,7 +28,12 @@ if(NOT WIN32)
   #install(TARGETS neorados DESTINATION bin)
 endif()
 
-add_executable(ceph-vector-bench ceph_vector_bench.cc)
+add_executable(ceph-vector-bench
+  ceph_vector_bench/ceph_vector_bench.cc
+  ceph_vector_bench/ceph_vector_bench_io.cc
+  ceph_vector_bench/ceph_vector_bench_verify.cc
+  ceph_vector_bench/ceph_vector_bench_recall.cc
+  ceph_vector_bench/ceph_vector_bench_load.cc)
 target_link_libraries(ceph-vector-bench librados global)
 install(TARGETS ceph-vector-bench DESTINATION bin)
 

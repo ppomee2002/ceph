@@ -73,6 +73,8 @@ int main(int argc, const char** argv)
     } else if (ceph_argparse_witharg(args, i, &val, "--num-tables", (char*)nullptr)) {
       opt.num_tables = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
       if (opt.num_tables == 0) opt.num_tables = 128;
+    } else if (ceph_argparse_witharg(args, i, &val, "--write-top-pgs", (char*)nullptr)) {
+      opt.write_top_pgs = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
     } else if (ceph_argparse_witharg(args, i, &val, "--probe-mode", (char*)nullptr)) {
       opt.probe_mode = val;
       if (opt.probe_mode != "union" && opt.probe_mode != "vote") opt.probe_mode = "union";
