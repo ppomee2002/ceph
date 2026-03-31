@@ -138,6 +138,7 @@ int run_vector_bench_recall(const VectorBenchOptions& opt) {
   size_t valid_queries = 0;
   size_t probe_pg_sum = 0;
   size_t cand_sum = 0;
+  size_t empty_target_queries = 0;
   double best_vote_sum = 0;
   double vote_concentration_sum = 0;
   std::vector<std::pair<float, size_t>> dist_idx;
@@ -148,27 +149,40 @@ int run_vector_bench_recall(const VectorBenchOptions& opt) {
     for (uint32_t t = 0; t < opt.num_tables; t++) {
       __u32 raw_hash = crush_hash32_lsh_multi(queries + q * qd, static_cast<int>(qd),
                                                 static_cast<int>(t));
-      uint32_t pg = hash_to_pg(raw_hash, opt.pg_num);
+      uint32_t pg = map_hash_to_pg(raw_hash, opt.pg_num, opt.pg_map_mode);
       pg_votes[pg]++;
     }
 
     std::vector<uint32_t> target_pgs;
     double this_best_vote = 0, this_concentration = 0;
-    if (opt.probe_mode == "vote") {
-      std::vector<std::pair<uint32_t, size_t>> ranked(pg_votes.begin(), pg_votes.end());
-      std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
-        if (a.second != b.second) return a.second > b.second;
-        return a.first < b.first;
-      });
+
+    std::vector<std::pair<uint32_t, size_t>> ranked(pg_votes.begin(), pg_votes.end());
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+      if (a.second != b.second) return a.second > b.second;
+      return a.first < b.first;
+    });
+    if (!ranked.empty()) {
+      this_best_vote = ranked[0].second;
+      this_concentration = (double)ranked[0].second / opt.num_tables;
+    }
+
+    if (opt.table_combine == "and") {
+      for (const auto& kv : ranked) {
+        if (kv.second == opt.num_tables)
+          target_pgs.push_back(kv.first);
+      }
+      if (opt.probe_pgs > 0 && target_pgs.size() > opt.probe_pgs)
+        target_pgs.resize(opt.probe_pgs);
+    } else if (opt.probe_mode == "vote") {
       for (size_t i = 0; i < ranked.size() && i < opt.probe_pgs; i++)
         target_pgs.push_back(ranked[i].first);
-      if (!ranked.empty()) {
-        this_best_vote = ranked[0].second;
-        this_concentration = (double)ranked[0].second / opt.num_tables;
-      }
     } else {
       for (const auto& kv : pg_votes)
         target_pgs.push_back(kv.first);
+    }
+    if (target_pgs.empty()) {
+      empty_target_queries++;
+      continue;
     }
 
     std::unordered_map<size_t, const float*> cand_dedup;
@@ -223,10 +237,13 @@ int run_vector_bench_recall(const VectorBenchOptions& opt) {
 
   std::cout << "\n=== Recall (pg_num=" << opt.pg_num << ", num_tables=" << opt.num_tables
             << ", k=" << gt_k << ", queries=" << valid_queries << "/" << qn << ") ===\n";
+  std::cout << "  PG map mode: " << opt.pg_map_mode << "\n";
+  std::cout << "  Table combine: " << opt.table_combine << "\n";
   std::cout << "  Average Recall@" << gt_k << ": " << avg_recall << "%\n";
   std::cout << "  Probe mode: " << opt.probe_mode << ", probe_pgs=" << opt.probe_pgs << "\n";
   std::cout << "  Avg PGs probed: " << avg_probe_pgs << "\n";
   std::cout << "  Avg candidates: " << avg_cands << "\n";
+  std::cout << "  Empty-target queries: " << empty_target_queries << "\n";
   if (opt.probe_mode == "vote") {
     std::cout << "  Avg best vote: " << avg_best_vote << ", vote concentration: " << avg_concentration << "%\n";
   }

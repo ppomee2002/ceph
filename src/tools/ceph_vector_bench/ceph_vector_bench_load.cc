@@ -67,6 +67,7 @@ int run_vector_bench_load(const VectorBenchOptions& opt) {
   std::unordered_map<uint32_t, size_t> pg_distribution;
   all_ops.reserve(n * opt.num_tables);
   size_t selected_pg_total = 0;
+  size_t skipped_vectors = 0;
 
   for (size_t i = 0; i < n; i++) {
     float* vec = vectors + i * d;
@@ -74,7 +75,7 @@ int run_vector_bench_load(const VectorBenchOptions& opt) {
     std::unordered_map<uint32_t, int64_t> pg_to_hash;
     for (uint32_t t = 0; t < opt.num_tables; t++) {
       __u32 raw_hash = crush_hash32_lsh_multi(vec, static_cast<int>(d), static_cast<int>(t));
-      uint32_t pg_id = hash_to_pg(raw_hash, opt.pg_num);
+      uint32_t pg_id = map_hash_to_pg(raw_hash, opt.pg_num, opt.pg_map_mode);
       pg_votes[pg_id]++;
       if (pg_to_hash.find(pg_id) == pg_to_hash.end())
         pg_to_hash[pg_id] = static_cast<int64_t>(raw_hash);
@@ -85,13 +86,29 @@ int run_vector_bench_load(const VectorBenchOptions& opt) {
       if (a.second != b.second) return a.second > b.second;
       return a.first < b.first;
     });
-    size_t keep_n = ranked.size();
+
+    std::vector<uint32_t> selected_pgs;
+    if (opt.table_combine == "and") {
+      for (const auto& kv : ranked) {
+        if (kv.second == opt.num_tables)
+          selected_pgs.push_back(kv.first);
+      }
+    } else {
+      for (const auto& kv : ranked)
+        selected_pgs.push_back(kv.first);
+    }
+
+    size_t keep_n = selected_pgs.size();
     if (opt.write_top_pgs > 0)
       keep_n = std::min<size_t>(keep_n, opt.write_top_pgs);
+    if (keep_n == 0) {
+      skipped_vectors++;
+      continue;
+    }
     selected_pg_total += keep_n;
 
     for (size_t r = 0; r < keep_n; r++) {
-      uint32_t pg_id = ranked[r].first;
+      uint32_t pg_id = selected_pgs[r];
       all_ops.push_back({i, pg_id, pg_to_hash[pg_id]});
       pg_distribution[pg_id]++;
     }
@@ -104,6 +121,8 @@ int run_vector_bench_load(const VectorBenchOptions& opt) {
   std::cout << "loading " << n << " vectors (dim=" << d << ") from " << opt.fvecs_file
             << " -> pool " << opt.pool_name << " (pg_num=" << opt.pg_num
             << ", num_tables=" << opt.num_tables << ", write_top_pgs=" << opt.write_top_pgs
+            << ", pg_map_mode=" << opt.pg_map_mode
+            << ", table_combine=" << opt.table_combine
             << ", fan-out writes=" << all_ops.size()
             << ", concurrency=" << concurrency << ")"
             << std::endl;
@@ -193,9 +212,18 @@ int run_vector_bench_load(const VectorBenchOptions& opt) {
     std::cout << "  Unique vectors:         " << n << "\n";
     std::cout << "  Avg selected PGs/vec:   " << avg_selected_pgs << "\n";
     std::cout << "  Storage overhead:       " << storage_overhead << "x (objects/vectors)\n";
+    std::cout << "  Skipped vectors:        " << skipped_vectors << "\n";
     std::cout << "  PGs used:               " << pg_count << " / " << opt.pg_num << "\n";
     std::cout << "  Objects per PG: min=" << min_per_pg << ", max=" << max_per_pg
               << ", avg=" << avg_per_pg << "\n";
+  } else {
+    std::cout << "\n=== Storage Statistics ===\n";
+    std::cout << "  Total objects (fan-out): 0\n";
+    std::cout << "  Unique vectors:         " << n << "\n";
+    std::cout << "  Avg selected PGs/vec:   0\n";
+    std::cout << "  Storage overhead:       0x (objects/vectors)\n";
+    std::cout << "  Skipped vectors:        " << skipped_vectors << "\n";
+    std::cout << "  PGs used:               0 / " << opt.pg_num << "\n";
   }
 
   return 0;

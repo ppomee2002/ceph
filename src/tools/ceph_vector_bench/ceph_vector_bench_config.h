@@ -20,6 +20,8 @@ struct VectorBenchOptions {
   uint32_t pg_num = 256;
   uint32_t num_tables = 128;
   uint32_t write_top_pgs = 0;
+  std::string pg_map_mode = "stable";
+  std::string table_combine = "or";
   std::string probe_mode = "union";
   uint32_t probe_pgs = 1;
 };

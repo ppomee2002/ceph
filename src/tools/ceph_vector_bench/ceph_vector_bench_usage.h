@@ -23,6 +23,8 @@ inline void vector_bench_usage(std::ostream& out) {
       << "  --recall             measure single-PG Recall vs ground truth\n"
       << "  --num-tables <N>     LSH tables for Fan-out (default: 128). Load/Recall.\n"
       << "  --write-top-pgs <N>  load: per-vector PG votes top-N only (0=all unique PGs)\n"
+      << "  --pg-map-mode <m>    PG mapping mode: stable|mixed (default: stable)\n"
+      << "  --table-combine <m>  multi-table combine: or|and (default: or)\n"
       << "  --pg-num <N>         PG count, sets LSH bits (default: 256). Load: match pool.\n"
       << "  --gt <ivecs>         ground truth (sift_groundtruth.ivecs)\n"
       << "  -n, --num <N>        limit base vectors (0=all)\n"

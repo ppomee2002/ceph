@@ -75,6 +75,14 @@ int main(int argc, const char** argv)
       if (opt.num_tables == 0) opt.num_tables = 128;
     } else if (ceph_argparse_witharg(args, i, &val, "--write-top-pgs", (char*)nullptr)) {
       opt.write_top_pgs = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+    } else if (ceph_argparse_witharg(args, i, &val, "--pg-map-mode", (char*)nullptr)) {
+      opt.pg_map_mode = val;
+      if (opt.pg_map_mode != "stable" && opt.pg_map_mode != "mixed")
+        opt.pg_map_mode = "stable";
+    } else if (ceph_argparse_witharg(args, i, &val, "--table-combine", (char*)nullptr)) {
+      opt.table_combine = val;
+      if (opt.table_combine != "or" && opt.table_combine != "and")
+        opt.table_combine = "or";
     } else if (ceph_argparse_witharg(args, i, &val, "--probe-mode", (char*)nullptr)) {
       opt.probe_mode = val;
       if (opt.probe_mode != "union" && opt.probe_mode != "vote") opt.probe_mode = "union";

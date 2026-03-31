@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <string>
 
 /** Squared L2; sqrt omitted for ordering-only use. */
 inline float l2_dist_sq(const float* a, const float* b, int dim) {
@@ -38,4 +39,24 @@ inline uint32_t hash_to_pg(uint32_t h, uint32_t pg_num) {
   if (static_cast<unsigned>(x & bmask) < static_cast<unsigned>(b))
     return static_cast<uint32_t>(x & bmask);
   return static_cast<uint32_t>(x & (bmask >> 1));
+}
+
+/** 32-bit finalizer mix so PG mapping can use all hash bits. */
+inline uint32_t mix_hash32(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+
+inline uint32_t hash_to_pg_mixed(uint32_t h, uint32_t pg_num) {
+  return hash_to_pg(mix_hash32(h), pg_num);
+}
+
+inline uint32_t map_hash_to_pg(uint32_t h, uint32_t pg_num, const std::string& mode) {
+  if (mode == "mixed")
+    return hash_to_pg_mixed(h, pg_num);
+  return hash_to_pg(h, pg_num);
 }
