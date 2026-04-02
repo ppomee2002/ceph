@@ -73,6 +73,11 @@ int main(int argc, const char** argv)
     } else if (ceph_argparse_witharg(args, i, &val, "--num-tables", (char*)nullptr)) {
       opt.num_tables = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
       if (opt.num_tables == 0) opt.num_tables = 128;
+    } else if (ceph_argparse_witharg(args, i, &val, "--table-set-size", (char*)nullptr)) {
+      opt.table_set_size = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+    } else if (ceph_argparse_witharg(args, i, &val, "--write-top-pgs-per-set", (char*)nullptr)) {
+      opt.write_top_pgs_per_set = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.write_top_pgs_per_set == 0) opt.write_top_pgs_per_set = 1;
     } else if (ceph_argparse_witharg(args, i, &val, "--write-top-pgs", (char*)nullptr)) {
       opt.write_top_pgs = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
     } else if (ceph_argparse_witharg(args, i, &val, "--pg-map-mode", (char*)nullptr)) {
@@ -83,12 +88,27 @@ int main(int argc, const char** argv)
       opt.table_combine = val;
       if (opt.table_combine != "or" && opt.table_combine != "and")
         opt.table_combine = "or";
+    } else if (ceph_argparse_witharg(args, i, &val, "--set-combine", (char*)nullptr)) {
+      opt.set_combine = val;
+      if (opt.set_combine != "or" && opt.set_combine != "and")
+        opt.set_combine = "and";
+    } else if (ceph_argparse_witharg(args, i, &val, "--set-replica-mode", (char*)nullptr)) {
+      opt.set_replica_mode = val;
+      if (opt.set_replica_mode != "none" && opt.set_replica_mode != "paired" &&
+          opt.set_replica_mode != "ring")
+        opt.set_replica_mode = "paired";
+    } else if (ceph_argparse_witharg(args, i, &val, "--replica-set-count", (char*)nullptr)) {
+      opt.replica_set_count = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.replica_set_count == 0) opt.replica_set_count = 1;
     } else if (ceph_argparse_witharg(args, i, &val, "--probe-mode", (char*)nullptr)) {
       opt.probe_mode = val;
       if (opt.probe_mode != "union" && opt.probe_mode != "vote") opt.probe_mode = "union";
     } else if (ceph_argparse_witharg(args, i, &val, "--probe-pgs", (char*)nullptr)) {
       opt.probe_pgs = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
       if (opt.probe_pgs == 0) opt.probe_pgs = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--probe-pgs-per-set", (char*)nullptr)) {
+      opt.probe_pgs_per_set = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.probe_pgs_per_set == 0) opt.probe_pgs_per_set = 1;
     } else if (ceph_argparse_witharg(args, i, &val, "--gt", (char*)nullptr)) {
       opt.gt_file = val;
     } else if (ceph_argparse_flag(args, i, "--verify-only", (char*)nullptr)) {
@@ -102,6 +122,24 @@ int main(int argc, const char** argv)
       return 0;
     } else {
       ++i;
+    }
+  }
+
+  if (opt.table_set_size > 0) {
+    if (opt.table_set_size > opt.num_tables) {
+      std::cerr << "error: --table-set-size must be <= --num-tables\n";
+      return 1;
+    }
+    if (opt.num_tables % opt.table_set_size != 0) {
+      std::cerr << "error: --num-tables must be divisible by --table-set-size\n";
+      return 1;
+    }
+    if (opt.set_replica_mode == "paired") {
+      const uint32_t set_count = opt.num_tables / opt.table_set_size;
+      if ((set_count % 2) != 0) {
+        std::cerr << "error: --set-replica-mode=paired requires even set count\n";
+        return 1;
+      }
     }
   }
 

@@ -23,6 +23,10 @@ extern __u32 crush_hash32_5(int type, __u32 a, __u32 b, __u32 c, __u32 d,
 #ifndef __KERNEL__
 /* Sign Random Projection (Cosine LSH) - embedding vector to 32-bit hash */
 extern __u32 crush_hash32_lsh(const float *vector, int dim);
+/* Same as above but mask to num_bits (for pg_num alignment) */
+extern __u32 crush_hash32_lsh_n(const float *vector, int dim, int num_bits);
+/* Multi-table LSH: table_id selects different hyperplanes (Fan-out architecture) */
+extern __u32 crush_hash32_lsh_multi(const float *vector, int dim, int table_id);
 #endif
 
 #endif

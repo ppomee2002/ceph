@@ -94,6 +94,7 @@ static __u32 crush_hash32_rjenkins1_5(__u32 a, __u32 b, __u32 c, __u32 d,
 
 #define LSH_NUM_HYPERPLANES  32
 #define LSH_MAX_DIM         1024
+#define LSH_MAX_TABLES      256
 
 /*
  * Deterministic PRNG for hyperplane init (LCG, no external deps).
@@ -108,6 +109,21 @@ static float lsh_rand_u01(unsigned int *state)
 static void lsh_init_hyperplanes(float planes[LSH_NUM_HYPERPLANES][LSH_MAX_DIM])
 {
 	unsigned int state = 1315423911u;
+	for (int i = 0; i < LSH_NUM_HYPERPLANES; i++) {
+		for (int j = 0; j < LSH_MAX_DIM; j++) {
+			planes[i][j] = lsh_rand_u01(&state);
+		}
+	}
+}
+
+/*
+ * Initialize hyperplanes for a specific table_id (different seed per table).
+ * Used for multi-table LSH (Fan-out architecture).
+ */
+static void lsh_init_hyperplanes_seeded(float planes[LSH_NUM_HYPERPLANES][LSH_MAX_DIM],
+					unsigned int seed)
+{
+	unsigned int state = seed;
 	for (int i = 0; i < LSH_NUM_HYPERPLANES; i++) {
 		for (int j = 0; j < LSH_MAX_DIM; j++) {
 			planes[i][j] = lsh_rand_u01(&state);
@@ -140,6 +156,55 @@ __u32 crush_hash32_lsh(const float *vector, int dim)
 		float dot = 0.0f;
 		const float *v = vector;
 		const float *h = lsh_planes[i];
+		int d = dim;
+
+		while (d--) {
+			dot += *v++ * *h++;
+		}
+
+		hash |= ((dot >= 0.0f) ? 1u : 0u) << i;
+	}
+	return hash;
+}
+
+__u32 crush_hash32_lsh_n(const float *vector, int dim, int num_bits)
+{
+	__u32 full = crush_hash32_lsh(vector, dim);
+	if (num_bits <= 0 || num_bits >= 32)
+		return full;
+	return full & ((1u << num_bits) - 1);
+}
+
+/*
+ * Multi-table LSH: table_id selects different random hyperplanes.
+ * Seed = base + table_id * 99991 for deterministic, independent tables.
+ * Used for Fan-out: N tables -> N hashes -> N PGs (with dedup).
+ */
+__u32 crush_hash32_lsh_multi(const float *vector, int dim, int table_id)
+{
+	static float lsh_planes_multi[LSH_MAX_TABLES][LSH_NUM_HYPERPLANES][LSH_MAX_DIM];
+	static int lsh_multi_inited[LSH_MAX_TABLES];
+
+	if (dim <= 0)
+		return 0;
+
+	if (table_id < 0 || table_id >= LSH_MAX_TABLES)
+		table_id = table_id % LSH_MAX_TABLES;
+
+	if (!lsh_multi_inited[table_id]) {
+		unsigned int seed = 1315423911u + ((unsigned int)table_id * 99991u);
+		lsh_init_hyperplanes_seeded(lsh_planes_multi[table_id], seed);
+		lsh_multi_inited[table_id] = 1;
+	}
+
+	if (dim > LSH_MAX_DIM)
+		dim = LSH_MAX_DIM;
+
+	__u32 hash = 0;
+	for (int i = 0; i < LSH_NUM_HYPERPLANES; i++) {
+		float dot = 0.0f;
+		const float *v = vector;
+		const float *h = lsh_planes_multi[table_id][i];
 		int d = dim;
 
 		while (d--) {

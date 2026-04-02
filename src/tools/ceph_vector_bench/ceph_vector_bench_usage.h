@@ -22,9 +22,14 @@ inline void vector_bench_usage(std::ostream& out) {
       << "  --verify-only        verify LSH locality, no Ceph connection\n"
       << "  --recall             measure single-PG Recall vs ground truth\n"
       << "  --num-tables <N>     LSH tables for Fan-out (default: 128). Load/Recall.\n"
+      << "  --table-set-size <N> split tables into sets (e.g. 16 with 32 tables => 2 sets)\n"
       << "  --write-top-pgs <N>  load: per-vector PG votes top-N only (0=all unique PGs)\n"
+      << "  --write-top-pgs-per-set <N> load: per set top-N PGs (default: 1)\n"
       << "  --pg-map-mode <m>    PG mapping mode: stable|mixed (default: stable)\n"
       << "  --table-combine <m>  multi-table combine: or|and (default: or)\n"
+      << "  --set-combine <m>    set-level combine: or|and (default: and)\n"
+      << "  --set-replica-mode   replica set policy: none|paired|ring (default: paired)\n"
+      << "  --replica-set-count  replica set count when mode=ring (default: 1)\n"
       << "  --pg-num <N>         PG count, sets LSH bits (default: 256). Load: match pool.\n"
       << "  --gt <ivecs>         ground truth (sift_groundtruth.ivecs)\n"
       << "  -n, --num <N>        limit base vectors (0=all)\n"
@@ -32,5 +37,6 @@ inline void vector_bench_usage(std::ostream& out) {
       << "  -o, --object-prefix  object prefix (default: vec_)\n"
       << "  -C, --create-pool    create pool (load)\n"
       << "  --probe-mode <m>     recall: union|vote (default: union)\n"
-      << "  --probe-pgs <N>      recall: top-N PGs in vote mode (default: 1)\n";
+      << "  --probe-pgs <N>      recall: global top-N PGs in vote mode (legacy)\n"
+      << "  --probe-pgs-per-set <N> recall: top-N PGs per set in vote mode (default: 1)\n";
 }
