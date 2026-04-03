@@ -116,6 +116,32 @@ static void lsh_init_hyperplanes(float planes[LSH_NUM_HYPERPLANES][LSH_MAX_DIM])
 	}
 }
 
+static int lsh_normalize_dim(int dim)
+{
+	if (dim <= 0)
+		return 0;
+	if (dim > LSH_MAX_DIM)
+		return LSH_MAX_DIM;
+	return dim;
+}
+
+static int lsh_normalize_bits(int num_bits)
+{
+	if (num_bits <= 0)
+		return 1;
+	if (num_bits > LSH_NUM_HYPERPLANES)
+		return LSH_NUM_HYPERPLANES;
+	return num_bits;
+}
+
+static int lsh_normalize_table_id(int table_id)
+{
+	int t = table_id % LSH_MAX_TABLES;
+	if (t < 0)
+		t += LSH_MAX_TABLES;
+	return t;
+}
+
 /*
  * Initialize hyperplanes for a specific table_id (different seed per table).
  * Used for multi-table LSH (Fan-out architecture).
@@ -135,12 +161,19 @@ static void lsh_init_hyperplanes_seeded(float planes[LSH_NUM_HYPERPLANES][LSH_MA
  * Sign Random Projection (Cosine LSH): 32 hyperplanes, dot products,
  * sign bits -> single __u32. Deterministic, no malloc, C99 only.
  */
-__u32 crush_hash32_lsh(const float *vector, int dim)
+int crush_hash32_lsh_bit(const float *vector, int dim, int bit_idx)
 {
 	static float lsh_planes[LSH_NUM_HYPERPLANES][LSH_MAX_DIM];
 	static int lsh_done;
+	float dot = 0.0f;
+	const float *v;
+	const float *h;
+	int d;
 
+	dim = lsh_normalize_dim(dim);
 	if (dim <= 0)
+		return 0;
+	if (bit_idx < 0 || bit_idx >= LSH_NUM_HYPERPLANES)
 		return 0;
 
 	if (!lsh_done) {
@@ -148,31 +181,13 @@ __u32 crush_hash32_lsh(const float *vector, int dim)
 		lsh_done = 1;
 	}
 
-	if (dim > LSH_MAX_DIM)
-		dim = LSH_MAX_DIM;
+	v = vector;
+	h = lsh_planes[bit_idx];
+	d = dim;
+	while (d--)
+		dot += *v++ * *h++;
 
-	__u32 hash = 0;
-	for (int i = 0; i < LSH_NUM_HYPERPLANES; i++) {
-		float dot = 0.0f;
-		const float *v = vector;
-		const float *h = lsh_planes[i];
-		int d = dim;
-
-		while (d--) {
-			dot += *v++ * *h++;
-		}
-
-		hash |= ((dot >= 0.0f) ? 1u : 0u) << i;
-	}
-	return hash;
-}
-
-__u32 crush_hash32_lsh_n(const float *vector, int dim, int num_bits)
-{
-	__u32 full = crush_hash32_lsh(vector, dim);
-	if (num_bits <= 0 || num_bits >= 32)
-		return full;
-	return full & ((1u << num_bits) - 1);
+	return (dot >= 0.0f) ? 1 : 0;
 }
 
 /*
@@ -180,16 +195,22 @@ __u32 crush_hash32_lsh_n(const float *vector, int dim, int num_bits)
  * Seed = base + table_id * 99991 for deterministic, independent tables.
  * Used for Fan-out: N tables -> N hashes -> N PGs (with dedup).
  */
-__u32 crush_hash32_lsh_multi(const float *vector, int dim, int table_id)
+int crush_hash32_lsh_multi_bit(const float *vector, int dim, int table_id, int bit_idx)
 {
 	static float lsh_planes_multi[LSH_MAX_TABLES][LSH_NUM_HYPERPLANES][LSH_MAX_DIM];
 	static int lsh_multi_inited[LSH_MAX_TABLES];
+	float dot = 0.0f;
+	const float *v;
+	const float *h;
+	int d;
 
+	dim = lsh_normalize_dim(dim);
 	if (dim <= 0)
 		return 0;
+	if (bit_idx < 0 || bit_idx >= LSH_NUM_HYPERPLANES)
+		return 0;
 
-	if (table_id < 0 || table_id >= LSH_MAX_TABLES)
-		table_id = table_id % LSH_MAX_TABLES;
+	table_id = lsh_normalize_table_id(table_id);
 
 	if (!lsh_multi_inited[table_id]) {
 		unsigned int seed = 1315423911u + ((unsigned int)table_id * 99991u);
@@ -197,22 +218,62 @@ __u32 crush_hash32_lsh_multi(const float *vector, int dim, int table_id)
 		lsh_multi_inited[table_id] = 1;
 	}
 
-	if (dim > LSH_MAX_DIM)
-		dim = LSH_MAX_DIM;
+	v = vector;
+	h = lsh_planes_multi[table_id][bit_idx];
+	d = dim;
+	while (d--)
+		dot += *v++ * *h++;
 
+	return (dot >= 0.0f) ? 1 : 0;
+}
+
+__u32 crush_hash32_lsh_k(const float *vector, int dim, int num_bits)
+{
 	__u32 hash = 0;
-	for (int i = 0; i < LSH_NUM_HYPERPLANES; i++) {
-		float dot = 0.0f;
-		const float *v = vector;
-		const float *h = lsh_planes_multi[table_id][i];
-		int d = dim;
-
-		while (d--) {
-			dot += *v++ * *h++;
-		}
-
-		hash |= ((dot >= 0.0f) ? 1u : 0u) << i;
+	int bits = lsh_normalize_bits(num_bits);
+	for (int i = 0; i < bits; i++) {
+		if (crush_hash32_lsh_bit(vector, dim, i))
+			hash |= (1u << i);
 	}
+	return hash;
+}
+
+__u32 crush_hash32_lsh_multi_k(const float *vector, int dim, int table_id, int num_bits)
+{
+	__u32 hash = 0;
+	int bits = lsh_normalize_bits(num_bits);
+	for (int i = 0; i < bits; i++) {
+		if (crush_hash32_lsh_multi_bit(vector, dim, table_id, i))
+			hash |= (1u << i);
+	}
+	return hash;
+}
+
+void crush_hash32_lsh_multi_tables(const float *vector, int dim, int num_tables,
+				   int num_bits, __u32 *out_hashes)
+{
+	if (!out_hashes || num_tables <= 0)
+		return;
+	for (int t = 0; t < num_tables; t++) {
+		out_hashes[t] = crush_hash32_lsh_multi_k(vector, dim, t, num_bits);
+	}
+}
+
+__u32 crush_hash32_lsh(const float *vector, int dim)
+{
+	return crush_hash32_lsh_k(vector, dim, LSH_NUM_HYPERPLANES);
+}
+
+__u32 crush_hash32_lsh_n(const float *vector, int dim, int num_bits)
+{
+	if (num_bits <= 0 || num_bits >= 32)
+		return crush_hash32_lsh_k(vector, dim, LSH_NUM_HYPERPLANES);
+	return crush_hash32_lsh_k(vector, dim, num_bits);
+}
+
+__u32 crush_hash32_lsh_multi(const float *vector, int dim, int table_id)
+{
+	__u32 hash = crush_hash32_lsh_multi_k(vector, dim, table_id, LSH_NUM_HYPERPLANES);
 	return hash;
 }
 

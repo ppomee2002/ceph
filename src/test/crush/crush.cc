@@ -1661,3 +1661,42 @@ extern "C" {
       << "Similar pairs same-PG rate " << similar_rate
       << " should exceed random rate " << random_rate;
   }
+
+  TEST(CrushLSH, OneBitCompositionMatchesLegacyApis) {
+    const int dim = 8;
+    const int table_id = 7;
+    float vec[] = {0.11f, -0.23f, 0.35f, 0.47f, -0.59f, 0.61f, -0.73f, 0.89f};
+
+    __u32 single_from_bits = 0;
+    __u32 multi_from_bits = 0;
+    for (int bit = 0; bit < 32; ++bit) {
+      if (crush_hash32_lsh_bit(vec, dim, bit))
+        single_from_bits |= (1u << bit);
+      if (crush_hash32_lsh_multi_bit(vec, dim, table_id, bit))
+        multi_from_bits |= (1u << bit);
+    }
+
+    EXPECT_EQ(single_from_bits, crush_hash32_lsh(vec, dim));
+    EXPECT_EQ(single_from_bits, crush_hash32_lsh_k(vec, dim, 32));
+    EXPECT_EQ(multi_from_bits, crush_hash32_lsh_multi(vec, dim, table_id));
+    EXPECT_EQ(multi_from_bits, crush_hash32_lsh_multi_k(vec, dim, table_id, 32));
+  }
+
+  TEST(CrushLSH, SimilarVectorsShareMoreBitsWithOneBitHash) {
+    const int dim = 6;
+    float ref[] = {0.90f, 0.80f, 0.10f, 0.00f, -0.20f, 0.30f};
+    float similar[] = {0.89f, 0.79f, 0.11f, 0.02f, -0.19f, 0.31f};
+    float farv[] = {0.00f, -0.10f, 0.95f, -0.92f, 0.70f, -0.85f};
+
+    int same_ref_sim = 0;
+    int same_ref_far = 0;
+    for (int bit = 0; bit < 32; ++bit) {
+      int b_ref = crush_hash32_lsh_multi_bit(ref, dim, 3, bit);
+      int b_sim = crush_hash32_lsh_multi_bit(similar, dim, 3, bit);
+      int b_far = crush_hash32_lsh_multi_bit(farv, dim, 3, bit);
+      if (b_ref == b_sim) same_ref_sim++;
+      if (b_ref == b_far) same_ref_far++;
+    }
+
+    EXPECT_GT(same_ref_sim, same_ref_far);
+  }
