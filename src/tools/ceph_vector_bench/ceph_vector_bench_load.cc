@@ -11,10 +11,6 @@
 
 #include "include/rados/librados.hpp"
 
-extern "C" {
-#include "crush/hash.h"
-}
-
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -82,6 +78,7 @@ int run_vector_bench_load(const VectorBenchOptions& opt) {
 
       for (const auto& sv : set_votes) {
         size_t keep_n = std::min<size_t>(opt.write_top_pgs_per_set, sv.ranked.size());
+        if (opt.repeat_select_single_pg) keep_n = std::min<size_t>(keep_n, 1);
         if (opt.write_top_pgs > 0) keep_n = std::min<size_t>(keep_n, opt.write_top_pgs);
         for (size_t r = 0; r < keep_n; ++r) {
           const auto& c = sv.ranked[r];
@@ -97,6 +94,7 @@ int run_vector_bench_load(const VectorBenchOptions& opt) {
           if (rs >= set_votes.size()) continue;
           const auto& rv = set_votes[rs];
           size_t replica_keep_n = std::min<size_t>(opt.write_top_pgs_per_set, rv.ranked.size());
+          if (opt.repeat_select_single_pg) replica_keep_n = std::min<size_t>(replica_keep_n, 1);
           if (opt.write_top_pgs > 0) replica_keep_n = std::min<size_t>(replica_keep_n, opt.write_top_pgs);
           for (size_t rr = 0; rr < replica_keep_n; ++rr) {
             const auto& c = rv.ranked[rr];
@@ -113,10 +111,15 @@ int run_vector_bench_load(const VectorBenchOptions& opt) {
       std::unordered_map<uint32_t, size_t> pg_votes;
       std::unordered_map<uint32_t, int64_t> pg_to_hash;
       for (uint32_t t = 0; t < opt.num_tables; ++t) {
-        __u32 raw_hash = crush_hash32_lsh_multi(vec, static_cast<int>(d), static_cast<int>(t));
-        uint32_t pg_id = map_hash_to_pg(raw_hash, opt.pg_num, opt.pg_map_mode);
-        pg_votes[pg_id]++;
-        if (pg_to_hash.find(pg_id) == pg_to_hash.end()) pg_to_hash[pg_id] = static_cast<int64_t>(raw_hash);
+        const uint32_t rounds = (opt.hash_backend == "orth-rot")
+          ? std::max<uint32_t>(1, opt.hash_repeat_rounds)
+          : 1u;
+        for (uint32_t r = 0; r < rounds; ++r) {
+          __u32 raw_hash = table_hash_for_vec(vec, static_cast<int>(d), t, opt, r);
+          uint32_t pg_id = map_hash_to_pg(raw_hash, opt.pg_num, opt.pg_map_mode);
+          pg_votes[pg_id]++;
+          if (pg_to_hash.find(pg_id) == pg_to_hash.end()) pg_to_hash[pg_id] = static_cast<int64_t>(raw_hash);
+        }
       }
 
       std::vector<std::pair<uint32_t, size_t>> ranked(pg_votes.begin(), pg_votes.end());
@@ -127,14 +130,19 @@ int run_vector_bench_load(const VectorBenchOptions& opt) {
 
       std::vector<uint32_t> selected_pgs;
       if (opt.table_combine == "and") {
+        const uint32_t rounds = (opt.hash_backend == "orth-rot")
+          ? std::max<uint32_t>(1, opt.hash_repeat_rounds)
+          : 1u;
+        const uint32_t need = opt.num_tables * rounds;
         for (const auto& kv : ranked) {
-          if (kv.second == opt.num_tables) selected_pgs.push_back(kv.first);
+          if (kv.second == need) selected_pgs.push_back(kv.first);
         }
       } else {
         for (const auto& kv : ranked) selected_pgs.push_back(kv.first);
       }
 
       size_t keep_n = selected_pgs.size();
+      if (opt.repeat_select_single_pg) keep_n = std::min<size_t>(keep_n, 1);
       if (opt.write_top_pgs > 0) keep_n = std::min<size_t>(keep_n, opt.write_top_pgs);
       for (size_t r = 0; r < keep_n; ++r) {
         uint32_t pg_id = selected_pgs[r];
@@ -155,6 +163,11 @@ int run_vector_bench_load(const VectorBenchOptions& opt) {
             << " -> pool " << opt.pool_name
             << " (num_tables=" << opt.num_tables
             << ", table_set_size=" << opt.table_set_size
+            << ", hash_backend=" << opt.hash_backend
+            << ", rot_seed=" << opt.rot_seed
+            << ", hash_bits=" << ((opt.hash_bits > 0) ? opt.hash_bits : valid_lsh_bits(opt.pg_num))
+            << ", hash_repeat_rounds=" << opt.hash_repeat_rounds
+            << ", repeat_select_single_pg=" << (opt.repeat_select_single_pg ? "true" : "false")
             << ", table_combine=" << opt.table_combine
             << ", set_combine=" << opt.set_combine
             << ", set_replica_mode=" << opt.set_replica_mode

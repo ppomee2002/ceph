@@ -30,4 +30,10 @@ struct VectorBenchOptions {
   std::string probe_mode = "union";
   uint32_t probe_pgs = 1;
   uint32_t probe_pgs_per_set = 1;
+  std::string hash_backend = "lsh"; // lsh|orth-rot
+  uint32_t rot_seed = 1315423911u;
+  uint32_t hash_bits = 0; // 0 => auto(valid_lsh_bits(pg_num))
+  uint32_t hash_repeat_rounds = 1; // repeated hashing rounds (orth-rot apply)
+  uint32_t repeat_seed_stride = 2654435761u; // per-round seed stride
+  bool repeat_select_single_pg = false; // choose top-1 PG after vote ranking
 };

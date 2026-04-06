@@ -11,10 +11,6 @@
 
 #include "include/rados/librados.hpp"
 
-extern "C" {
-#include "crush/hash.h"
-}
-
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -123,14 +119,23 @@ int run_vector_bench_recall(const VectorBenchOptions& opt) {
     if (opt.table_set_size > 0) {
       auto set_votes = build_set_votes(queries + q * qd, static_cast<int>(qd), opt);
       for (const auto& sv : set_votes) {
-        append_probe_pgs_for_set(sv, opt, &target_pgs);
+        if (opt.repeat_select_single_pg) {
+          if (!sv.ranked.empty()) target_pgs.insert(sv.ranked.front().pg_id);
+        } else {
+          append_probe_pgs_for_set(sv, opt, &target_pgs);
+        }
       }
     } else {
       std::unordered_map<uint32_t, size_t> pg_votes;
       for (uint32_t t = 0; t < opt.num_tables; ++t) {
-        __u32 raw_hash = crush_hash32_lsh_multi(queries + q * qd, static_cast<int>(qd), static_cast<int>(t));
-        uint32_t pg = map_hash_to_pg(raw_hash, opt.pg_num, opt.pg_map_mode);
-        pg_votes[pg]++;
+        const uint32_t rounds = (opt.hash_backend == "orth-rot")
+          ? std::max<uint32_t>(1, opt.hash_repeat_rounds)
+          : 1u;
+        for (uint32_t r = 0; r < rounds; ++r) {
+          __u32 raw_hash = table_hash_for_vec(queries + q * qd, static_cast<int>(qd), t, opt, r);
+          uint32_t pg = map_hash_to_pg(raw_hash, opt.pg_num, opt.pg_map_mode);
+          pg_votes[pg]++;
+        }
       }
       std::vector<std::pair<uint32_t, size_t>> ranked(pg_votes.begin(), pg_votes.end());
       std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
@@ -138,9 +143,15 @@ int run_vector_bench_recall(const VectorBenchOptions& opt) {
         return a.first < b.first;
       });
       if (opt.table_combine == "and") {
+        const uint32_t rounds = (opt.hash_backend == "orth-rot")
+          ? std::max<uint32_t>(1, opt.hash_repeat_rounds)
+          : 1u;
+        const uint32_t need = opt.num_tables * rounds;
         for (const auto& kv : ranked) {
-          if (kv.second == opt.num_tables) target_pgs.insert(kv.first);
+          if (kv.second == need) target_pgs.insert(kv.first);
         }
+      } else if (opt.repeat_select_single_pg) {
+        if (!ranked.empty()) target_pgs.insert(ranked.front().first);
       } else if (opt.probe_mode == "vote") {
         for (size_t i = 0; i < ranked.size() && i < opt.probe_pgs; ++i) {
           target_pgs.insert(ranked[i].first);
@@ -193,6 +204,12 @@ int run_vector_bench_recall(const VectorBenchOptions& opt) {
   double qps = (sec > 0) ? valid_queries / sec : 0;
 
   std::cout << "=== Recall ===\n";
+  std::cout << "hash_backend: " << opt.hash_backend
+            << ", rot_seed: " << opt.rot_seed
+            << ", hash_bits: " << ((opt.hash_bits > 0) ? opt.hash_bits : valid_lsh_bits(opt.pg_num))
+            << ", hash_repeat_rounds: " << opt.hash_repeat_rounds
+            << ", repeat_select_single_pg: " << (opt.repeat_select_single_pg ? "true" : "false")
+            << "\n";
   std::cout << "recall@" << gt_k << ": " << avg_recall << "%\n";
   std::cout << "avg_probe_pgs: " << avg_probe << "\n";
   std::cout << "avg_candidates: " << avg_cands << ", empty_target_queries: " << empty_target_queries << "\n";

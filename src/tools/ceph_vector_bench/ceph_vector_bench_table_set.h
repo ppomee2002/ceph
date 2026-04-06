@@ -37,6 +37,18 @@ inline uint32_t get_table_set_count(const VectorBenchOptions& opt) {
   return std::max<uint32_t>(1, opt.num_tables / set_size);
 }
 
+inline __u32 table_hash_for_vec(const float* vec, int dim, uint32_t table_id,
+                                const VectorBenchOptions& opt,
+                                uint32_t repeat_idx = 0) {
+  if (opt.hash_backend == "orth-rot") {
+    const int bits = static_cast<int>(
+      (opt.hash_bits > 0) ? std::min<uint32_t>(opt.hash_bits, 32u) : valid_lsh_bits(opt.pg_num));
+    const uint32_t seed = opt.rot_seed + repeat_idx * opt.repeat_seed_stride;
+    return crush_hash32_orth_multi_k(vec, dim, static_cast<int>(table_id), bits, seed);
+  }
+  return crush_hash32_lsh_multi(vec, dim, static_cast<int>(table_id));
+}
+
 inline std::vector<SetVote> build_set_votes(const float* vec, int dim, const VectorBenchOptions& opt) {
   std::vector<SetVote> out;
   const uint32_t set_size = get_table_set_size(opt);
@@ -51,11 +63,16 @@ inline std::vector<SetVote> build_set_votes(const float* vec, int dim, const Vec
     std::unordered_map<uint32_t, size_t> pg_votes;
     std::unordered_map<uint32_t, int64_t> pg_hash;
     for (uint32_t t = tb; t < te; ++t) {
-      __u32 raw_hash = crush_hash32_lsh_multi(vec, dim, static_cast<int>(t));
-      uint32_t pg = map_hash_to_pg(raw_hash, opt.pg_num, opt.pg_map_mode);
-      pg_votes[pg]++;
-      if (pg_hash.find(pg) == pg_hash.end()) {
-        pg_hash[pg] = static_cast<int64_t>(raw_hash);
+      const uint32_t rounds = (opt.hash_backend == "orth-rot")
+        ? std::max<uint32_t>(1, opt.hash_repeat_rounds)
+        : 1u;
+      for (uint32_t r = 0; r < rounds; ++r) {
+        __u32 raw_hash = table_hash_for_vec(vec, dim, t, opt, r);
+        uint32_t pg = map_hash_to_pg(raw_hash, opt.pg_num, opt.pg_map_mode);
+        pg_votes[pg]++;
+        if (pg_hash.find(pg) == pg_hash.end()) {
+          pg_hash[pg] = static_cast<int64_t>(raw_hash);
+        }
       }
     }
 
@@ -70,7 +87,10 @@ inline std::vector<SetVote> build_set_votes(const float* vec, int dim, const Vec
     });
 
     if (combine_mode == "and") {
-      const uint32_t need = te - tb;
+      const uint32_t rounds = (opt.hash_backend == "orth-rot")
+        ? std::max<uint32_t>(1, opt.hash_repeat_rounds)
+        : 1u;
+      const uint32_t need = (te - tb) * rounds;
       ranked.erase(
         std::remove_if(ranked.begin(), ranked.end(), [need](const SetCandidate& c) {
           return c.votes != need;

@@ -4,10 +4,7 @@
 #include "ceph_vector_bench_config.h"
 #include "ceph_vector_bench_io.h"
 #include "ceph_vector_bench_pg.h"
-
-extern "C" {
-#include "crush/hash.h"
-}
+#include "ceph_vector_bench_table_set.h"
 
 #include <cstdlib>
 #include <ctime>
@@ -29,8 +26,8 @@ int run_vector_bench_verify(const VectorBenchOptions& opt) {
   unsigned vbits = valid_lsh_bits(opt.pg_num);
   std::vector<uint32_t> pg(n);
   for (size_t i = 0; i < n; i++) {
-    uint32_t lsh_h = crush_hash32_lsh_n(vectors + i * d, static_cast<int>(d), vbits);
-    pg[i] = map_hash_to_pg(lsh_h, opt.pg_num, opt.pg_map_mode);
+    uint32_t h = table_hash_for_vec(vectors + i * d, static_cast<int>(d), 0, opt);
+    pg[i] = map_hash_to_pg(h, opt.pg_num, opt.pg_map_mode);
   }
 
   const size_t intra_samples = 50000;
@@ -74,7 +71,8 @@ int run_vector_bench_verify(const VectorBenchOptions& opt) {
   double inter_avg = (inter_count > 0) ? (inter_sum / inter_count) : 0;
 
   std::cout << "=== LSH Locality Verification (n=" << n << ", dim=" << d
-            << ", pg_num=" << opt.pg_num << ", lsh_bits=" << vbits << ") ===\n";
+            << ", pg_num=" << opt.pg_num << ", lsh_bits=" << vbits
+            << ", hash_backend=" << opt.hash_backend << ") ===\n";
   std::cout << "  PG map mode: " << opt.pg_map_mode << "\n";
   std::cout << "  intra-PG avg L2 distance: " << intra_avg << "\n";
   std::cout << "  inter-PG avg L2 distance: " << inter_avg << "\n";

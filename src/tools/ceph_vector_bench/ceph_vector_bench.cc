@@ -23,6 +23,7 @@
 
 #include "ceph_vector_bench_config.h"
 #include "ceph_vector_bench_load.h"
+#include "ceph_vector_bench_pg.h"
 #include "ceph_vector_bench_recall.h"
 #include "ceph_vector_bench_usage.h"
 #include "ceph_vector_bench_verify.h"
@@ -109,6 +110,22 @@ int main(int argc, const char** argv)
     } else if (ceph_argparse_witharg(args, i, &val, "--probe-pgs-per-set", (char*)nullptr)) {
       opt.probe_pgs_per_set = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
       if (opt.probe_pgs_per_set == 0) opt.probe_pgs_per_set = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--hash-backend", (char*)nullptr)) {
+      opt.hash_backend = val;
+      if (opt.hash_backend != "lsh" && opt.hash_backend != "orth-rot")
+        opt.hash_backend = "lsh";
+    } else if (ceph_argparse_witharg(args, i, &val, "--rot-seed", (char*)nullptr)) {
+      opt.rot_seed = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+    } else if (ceph_argparse_witharg(args, i, &val, "--hash-bits", (char*)nullptr)) {
+      opt.hash_bits = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.hash_bits > 32) opt.hash_bits = 32;
+    } else if (ceph_argparse_witharg(args, i, &val, "--hash-repeat-rounds", (char*)nullptr)) {
+      opt.hash_repeat_rounds = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.hash_repeat_rounds == 0) opt.hash_repeat_rounds = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--repeat-seed-stride", (char*)nullptr)) {
+      opt.repeat_seed_stride = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+    } else if (ceph_argparse_flag(args, i, "--repeat-select-single-pg", (char*)nullptr)) {
+      opt.repeat_select_single_pg = true;
     } else if (ceph_argparse_witharg(args, i, &val, "--gt", (char*)nullptr)) {
       opt.gt_file = val;
     } else if (ceph_argparse_flag(args, i, "--verify-only", (char*)nullptr)) {
@@ -141,6 +158,10 @@ int main(int argc, const char** argv)
         return 1;
       }
     }
+  }
+
+  if (opt.hash_backend == "orth-rot" && opt.hash_bits == 0) {
+    opt.hash_bits = valid_lsh_bits(opt.pg_num);
   }
 
   if (opt.verify_only)
