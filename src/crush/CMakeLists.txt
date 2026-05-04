@@ -3,6 +3,7 @@ set(crush_srcs
   mapper.c
   crush.c
   hash.c
+  hash_faiss_rotation.cc
   CrushWrapper.cc
   CrushCompiler.cc
   CrushTester.cc

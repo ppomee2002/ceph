@@ -110,10 +110,56 @@ int main(int argc, const char** argv)
     } else if (ceph_argparse_witharg(args, i, &val, "--probe-pgs-per-set", (char*)nullptr)) {
       opt.probe_pgs_per_set = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
       if (opt.probe_pgs_per_set == 0) opt.probe_pgs_per_set = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--qps-mode", (char*)nullptr)) {
+      opt.qps_mode = val;
+      if (opt.qps_mode != "memory" && opt.qps_mode != "end_to_end") opt.qps_mode = "memory";
+    } else if (ceph_argparse_witharg(args, i, &val, "--warmup-queries", (char*)nullptr)) {
+      opt.warmup_queries = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+    } else if (ceph_argparse_flag(args, i, "--latency-report", (char*)nullptr)) {
+      opt.latency_report = true;
     } else if (ceph_argparse_witharg(args, i, &val, "--hash-backend", (char*)nullptr)) {
       opt.hash_backend = val;
-      if (opt.hash_backend != "lsh" && opt.hash_backend != "orth-rot")
+      if (opt.hash_backend == "orth-rot")
+        opt.hash_backend = "orth-sign";
+      if (opt.hash_backend == "annoy_tree")
+        opt.hash_backend = "annoy";
+      if (opt.hash_backend != "lsh" &&
+          opt.hash_backend != "orth-sign" &&
+          opt.hash_backend != "rotation" &&
+          opt.hash_backend != "faiss_rotation" &&
+          opt.hash_backend != "rotation_repr1" &&
+          opt.hash_backend != "annoy" &&
+          opt.hash_backend != "pivot" &&
+          opt.hash_backend != "hybrid")
         opt.hash_backend = "lsh";
+    } else if (ceph_argparse_witharg(args, i, &val, "--pivot-build-sample", (char*)nullptr)) {
+      opt.pivot_build_sample = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.pivot_build_sample == 0) opt.pivot_build_sample = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--pivot-probe-budget", (char*)nullptr)) {
+      opt.pivot_probe_budget = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.pivot_probe_budget == 0) opt.pivot_probe_budget = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--hybrid-lsh-vote-topk", (char*)nullptr)) {
+      opt.hybrid_lsh_vote_topk = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.hybrid_lsh_vote_topk == 0) opt.hybrid_lsh_vote_topk = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--hybrid-pivot-topk", (char*)nullptr)) {
+      opt.hybrid_pivot_topk = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.hybrid_pivot_topk == 0) opt.hybrid_pivot_topk = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--annoy-n-trees", (char*)nullptr)) {
+      opt.annoy_n_trees = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.annoy_n_trees == 0) opt.annoy_n_trees = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--annoy-search-k", (char*)nullptr)) {
+      opt.annoy_search_k = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.annoy_search_k == 0) opt.annoy_search_k = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--annoy-leaf-size", (char*)nullptr)) {
+      opt.annoy_leaf_size = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.annoy_leaf_size == 0) opt.annoy_leaf_size = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--annoy-build-sample", (char*)nullptr)) {
+      opt.annoy_build_sample = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+    } else if (ceph_argparse_witharg(args, i, &val, "--annoy-dist", (char*)nullptr)) {
+      opt.annoy_dist = val;
+      if (opt.annoy_dist != "l2" && opt.annoy_dist != "angular") opt.annoy_dist = "l2";
+    } else if (ceph_argparse_witharg(args, i, &val, "--annoy-seed", (char*)nullptr)) {
+      opt.annoy_seed = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
     } else if (ceph_argparse_witharg(args, i, &val, "--rot-seed", (char*)nullptr)) {
       opt.rot_seed = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
     } else if (ceph_argparse_witharg(args, i, &val, "--hash-bits", (char*)nullptr)) {
@@ -126,6 +172,32 @@ int main(int argc, const char** argv)
       opt.repeat_seed_stride = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
     } else if (ceph_argparse_flag(args, i, "--repeat-select-single-pg", (char*)nullptr)) {
       opt.repeat_select_single_pg = true;
+    } else if (ceph_argparse_witharg(args, i, &val, "--rotation-use-dims", (char*)nullptr)) {
+      opt.rotation_use_dims = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.rotation_use_dims == 0) opt.rotation_use_dims = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--rotation-bins-per-dim", (char*)nullptr)) {
+      opt.rotation_bins_per_dim = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.rotation_bins_per_dim < 2) opt.rotation_bins_per_dim = 2;
+    } else if (ceph_argparse_witharg(args, i, &val, "--rotation-min", (char*)nullptr)) {
+      opt.rotation_min = strtof(val.c_str(), nullptr);
+    } else if (ceph_argparse_witharg(args, i, &val, "--rotation-width", (char*)nullptr)) {
+      opt.rotation_width = strtof(val.c_str(), nullptr);
+      if (opt.rotation_width <= 0.0f) opt.rotation_width = 1.0f;
+    } else if (ceph_argparse_witharg(args, i, &val, "--rotation-neighbor-step", (char*)nullptr)) {
+      opt.rotation_neighbor_step = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+    } else if (ceph_argparse_flag(args, i, "--rotation-auto-calibration", (char*)nullptr)) {
+      opt.rotation_auto_calibration = true;
+    } else if (ceph_argparse_flag(args, i, "--no-rotation-auto-calibration", (char*)nullptr)) {
+      opt.rotation_auto_calibration = false;
+    } else if (ceph_argparse_witharg(args, i, &val, "--rotation-calibration-samples", (char*)nullptr)) {
+      opt.rotation_calibration_samples = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+      if (opt.rotation_calibration_samples == 0) opt.rotation_calibration_samples = 1;
+    } else if (ceph_argparse_witharg(args, i, &val, "--rotation-calibration-clip-percentile", (char*)nullptr)) {
+      opt.rotation_calibration_clip_percentile = strtof(val.c_str(), nullptr);
+      if (opt.rotation_calibration_clip_percentile < 0.0f) opt.rotation_calibration_clip_percentile = 0.0f;
+      if (opt.rotation_calibration_clip_percentile >= 0.5f) opt.rotation_calibration_clip_percentile = 0.49f;
+    } else if (ceph_argparse_flag(args, i, "--verify-faiss-rotation-match", (char*)nullptr)) {
+      opt.verify_faiss_rotation_match = true;
     } else if (ceph_argparse_witharg(args, i, &val, "--gt", (char*)nullptr)) {
       opt.gt_file = val;
     } else if (ceph_argparse_flag(args, i, "--verify-only", (char*)nullptr)) {
@@ -160,8 +232,16 @@ int main(int argc, const char** argv)
     }
   }
 
-  if (opt.hash_backend == "orth-rot" && opt.hash_bits == 0) {
+  if (opt.hash_backend == "orth-sign" && opt.hash_bits == 0) {
     opt.hash_bits = valid_lsh_bits(opt.pg_num);
+  }
+
+  if ((opt.hash_backend == "rotation" ||
+       opt.hash_backend == "faiss_rotation" ||
+       opt.hash_backend == "rotation_repr1" ||
+       opt.hash_backend == "annoy") &&
+      opt.hash_repeat_rounds > 1) {
+    std::cerr << "warning: hash_repeat_rounds is ignored for rotation/faiss_rotation/rotation_repr1/annoy backend\n";
   }
 
   if (opt.verify_only)

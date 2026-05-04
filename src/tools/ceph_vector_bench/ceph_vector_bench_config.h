@@ -30,10 +30,32 @@ struct VectorBenchOptions {
   std::string probe_mode = "union";
   uint32_t probe_pgs = 1;
   uint32_t probe_pgs_per_set = 1;
-  std::string hash_backend = "lsh"; // lsh|orth-rot
+  std::string hash_backend = "lsh"; // lsh|orth-sign|rotation|faiss_rotation|rotation_repr1|annoy|pivot|hybrid
+  uint32_t pivot_build_sample = 4096;
+  uint32_t pivot_probe_budget = 8;
+  uint32_t hybrid_lsh_vote_topk = 8;
+  uint32_t hybrid_pivot_topk = 4;
+  uint32_t annoy_n_trees = 16;
+  uint32_t annoy_search_k = 256;
+  uint32_t annoy_leaf_size = 64;
+  uint32_t annoy_build_sample = 0; // 0 => use all vectors
+  std::string annoy_dist = "l2"; // l2|angular
+  uint32_t annoy_seed = 1315423911u;
+  std::string qps_mode = "memory"; // memory|end_to_end
+  uint32_t warmup_queries = 0;
+  bool latency_report = false;
   uint32_t rot_seed = 1315423911u;
   uint32_t hash_bits = 0; // 0 => auto(valid_lsh_bits(pg_num))
-  uint32_t hash_repeat_rounds = 1; // repeated hashing rounds (orth-rot apply)
+  uint32_t hash_repeat_rounds = 1; // repeated hashing rounds (orth-sign apply)
   uint32_t repeat_seed_stride = 2654435761u; // per-round seed stride
   bool repeat_select_single_pg = false; // choose top-1 PG after vote ranking
+  uint32_t rotation_use_dims = 4;
+  uint32_t rotation_bins_per_dim = 8;
+  float rotation_min = -2.5f;
+  float rotation_width = 1.25f;
+  uint32_t rotation_neighbor_step = 0;
+  bool rotation_auto_calibration = true;
+  uint32_t rotation_calibration_samples = 4096;
+  float rotation_calibration_clip_percentile = 0.01f;
+  bool verify_faiss_rotation_match = false;
 };
