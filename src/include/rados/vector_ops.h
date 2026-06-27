@@ -26,7 +26,8 @@ inline constexpr uint32_t vector_distance_metric_euclidean = 1;
 inline constexpr uint32_t vector_distance_metric_cosine = 2;
 inline constexpr uint32_t vector_distance_metric_dot = 3;
 
-inline constexpr uint32_t vector_query_algorithm_flat = 1;
+inline constexpr uint32_t vector_query_algorithm_hash = 1;
+inline constexpr uint32_t vector_query_algorithm_bit_lsh = 2;
 inline constexpr uint32_t vector_query_algorithm_version_0 = 0;
 
 inline int vector_data_type_size(uint32_t data_type, size_t *size)

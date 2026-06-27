@@ -21,6 +21,8 @@
 #include "librados/AioCompletionImpl.h"
 #include "librados/PoolAsyncCompletionImpl.h"
 #include "librados/RadosClient.h"
+#include "librados/vector_placement.h"
+#include "librados/vector_query_planner.h"
 #include "include/ceph_assert.h"
 #include "include/ceph_hash.h"
 #include "include/encoding.h"
@@ -242,8 +244,6 @@ struct C_aio_selfmanaged_snap_create_Complete : public C_aio_selfmanaged_snap_op
 
 namespace {
 
-static constexpr const char *vector_placement_algorithm = "hash-v0";
-
 static_assert(LIBRADOS_VECTOR_MAX_DIMENSION ==
               ceph::rados::vector_max_dimension);
 static_assert(LIBRADOS_VECTOR_DATA_TYPE_FLOAT32 ==
@@ -255,26 +255,8 @@ static_assert(LIBRADOS_VECTOR_DISTANCE_METRIC_COSINE ==
 static_assert(LIBRADOS_VECTOR_DISTANCE_METRIC_DOT ==
               ceph::rados::vector_distance_metric_dot);
 
-std::string vector_hex_u32(uint32_t value)
-{
-  char buf[9];
-  snprintf(buf, sizeof(buf), "%08x", value);
-  return std::string(buf);
-}
-
-std::string vector_hash_string(const std::string& value)
-{
-  return vector_hex_u32(ceph_str_hash_rjenkins(
-      value.c_str(), static_cast<unsigned>(value.length())));
-}
-
-struct vector_placement_result {
-  object_t oid;
-  std::string placement_key;
-  std::string vector_hash;
-};
-
-vector_placement_result vector_compute_hash_placement(
+librados::vector_placement::hash_v0_placement_t
+vector_compute_hash_placement(
     const std::string& vector_bucket_name,
     const std::string& index_name,
     const std::string& key,
@@ -283,16 +265,8 @@ vector_placement_result vector_compute_hash_placement(
   (void)key;
   // Provisional vector-derived placement. The final LSH/hybrid policy should
   // replace this helper without changing the public API or storage op shape.
-  const std::string vector_hash =
-    vector_hex_u32(vector_data.crc32c(static_cast<uint32_t>(-1)));
-  const std::string placement_key = vector_hash.substr(0, 4);
-  const std::string oid =
-    ".rados.vector/v1/" + std::string(vector_placement_algorithm) + "/" +
-    vector_hash_string(vector_bucket_name) + "/" +
-    vector_hash_string(index_name) + "/" +
-    placement_key;
-
-  return {object_t(oid), placement_key, vector_hash};
+  return librados::vector_placement::compute_hash_v0_placement(
+      vector_bucket_name, index_name, vector_data);
 }
 
 } // anonymous namespace
@@ -718,7 +692,7 @@ int librados::IoCtxImpl::put_vector(const std::string& vector_bucket_name,
   req.dimension = dimension;
   req.vector_data = vector_data;
   req.metadata = metadata;
-  req.placement_algorithm = vector_placement_algorithm;
+  req.placement_algorithm = librados::vector_placement::hash_v0_algorithm;
   req.placement_key = placement.placement_key;
   req.vector_hash = placement.vector_hash;
 
@@ -785,13 +759,24 @@ int librados::IoCtxImpl::query_vectors(
   req.top_k = top_k;
   req.return_distance = return_distance;
   req.query_vector = query_vector;
-  req.algorithm_id = ceph::rados::vector_query_algorithm_flat;
+  req.algorithm_id = ceph::rados::vector_query_algorithm_hash;
   req.algorithm_version = ceph::rados::vector_query_algorithm_version_0;
 
-  bufferlist payload;
-  encode(req, payload);
-  // Query planning and backend execution are intentionally added in follow-up
-  // PRs. PR1 only validates the public API and prepares the request format.
+  librados::vector_query::plan_t plan;
+  r = librados::vector_query::build_plan(req, &plan);
+  if (r < 0) {
+    return r;
+  }
+
+  std::vector<librados::vector_query::routed_request_t> routed_requests;
+  r = librados::vector_query::build_routed_requests(
+      req, plan, &routed_requests);
+  if (r < 0) {
+    return r;
+  }
+
+  // PR2 stops at client-side planning and routed payload construction. PR3
+  // will add ObjectOperation/query op plumbing and backend execution.
   return -EOPNOTSUPP;
 }
 

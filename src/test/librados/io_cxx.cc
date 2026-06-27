@@ -12,6 +12,8 @@
 #include "include/encoding.h"
 #include "include/err.h"
 #include "include/scope_guard.h"
+#include "librados/vector_placement.h"
+#include "librados/vector_query_planner.h"
 #include "test/librados/test_cxx.h"
 #include "test/librados/testcase_cxx.h"
 
@@ -60,6 +62,103 @@ static string vector_entry_id(const string& bucket, const string& index,
   value.append(key);
   return vector_hex_u32(ceph_str_hash_rjenkins(
       value.c_str(), static_cast<unsigned>(value.length())));
+}
+
+static ceph::rados::query_vectors_request_t make_query_planner_request(
+    const string& bucket,
+    const string& index,
+    const bufferlist& query_vector)
+{
+  ceph::rados::query_vectors_request_t req;
+  req.bucket_name = bucket;
+  req.index_name = index;
+  req.data_type = LIBRADOS_VECTOR_DATA_TYPE_FLOAT32;
+  req.distance_metric = LIBRADOS_VECTOR_DISTANCE_METRIC_COSINE;
+  req.dimension = 4;
+  req.top_k = 10;
+  req.return_distance = true;
+  req.query_vector = query_vector;
+  req.algorithm_id = ceph::rados::vector_query_algorithm_hash;
+  req.algorithm_version = ceph::rados::vector_query_algorithm_version_0;
+  return req;
+}
+
+TEST(VectorQueryPlanner, HashV0DeterministicRouting) {
+  float query[] = {1.0, 2.0, 3.0, 4.0};
+  bufferlist query_bl;
+  query_bl.append(reinterpret_cast<const char *>(query), sizeof(query));
+
+  auto req = make_query_planner_request("bucket", "index", query_bl);
+  librados::vector_query::plan_t plan1;
+  librados::vector_query::plan_t plan2;
+  ASSERT_EQ(0, librados::vector_query::build_plan(req, &plan1));
+  ASSERT_EQ(0, librados::vector_query::build_plan(req, &plan2));
+  ASSERT_EQ(1u, plan1.probes.size());
+  ASSERT_EQ(1u, plan2.probes.size());
+  EXPECT_EQ(ceph::rados::vector_query_algorithm_hash, plan1.algorithm_id);
+  EXPECT_EQ(ceph::rados::vector_query_algorithm_version_0,
+            plan1.algorithm_version);
+  EXPECT_EQ(plan1.probes[0].oid.name, plan2.probes[0].oid.name);
+  EXPECT_EQ(plan1.probes[0].placement_key,
+            plan2.probes[0].placement_key);
+  const auto put_placement =
+    librados::vector_placement::compute_hash_v0_placement(
+        "bucket", "index", query_bl);
+  const auto vector_hash =
+    librados::vector_placement::hash_v0_vector_hash(query_bl);
+  EXPECT_EQ(librados::vector_placement::hash_v0_placement_key(vector_hash),
+            plan1.probes[0].placement_key);
+  EXPECT_EQ(put_placement.vector_hash, vector_hash);
+  EXPECT_EQ(put_placement.placement_key, plan1.probes[0].placement_key);
+  EXPECT_EQ(put_placement.oid.name, plan1.probes[0].oid.name);
+  EXPECT_EQ(librados::vector_placement::make_hash_v0_oid(
+      "bucket", "index", plan1.probes[0].placement_key).name,
+      plan1.probes[0].oid.name);
+
+  std::vector<librados::vector_query::routed_request_t> requests;
+  ASSERT_EQ(0, librados::vector_query::build_routed_requests(
+      req, plan1, &requests));
+  ASSERT_EQ(1u, requests.size());
+  EXPECT_EQ(plan1.probes[0].oid.name, requests[0].oid.name);
+  EXPECT_EQ(plan1.probes[0].placement_key, requests[0].placement_key);
+  EXPECT_GT(requests[0].payload.length(), 0u);
+}
+
+TEST(VectorQueryPlanner, HashV0SeparatesBucketAndIndex) {
+  float query[] = {1.0, 2.0, 3.0, 4.0};
+  bufferlist query_bl;
+  query_bl.append(reinterpret_cast<const char *>(query), sizeof(query));
+
+  librados::vector_query::plan_t base;
+  librados::vector_query::plan_t other_bucket;
+  librados::vector_query::plan_t other_index;
+  ASSERT_EQ(0, librados::vector_query::build_plan(
+      make_query_planner_request("bucket", "index", query_bl), &base));
+  ASSERT_EQ(0, librados::vector_query::build_plan(
+      make_query_planner_request("bucket-2", "index", query_bl),
+      &other_bucket));
+  ASSERT_EQ(0, librados::vector_query::build_plan(
+      make_query_planner_request("bucket", "index-2", query_bl),
+      &other_index));
+
+  ASSERT_EQ(1u, base.probes.size());
+  ASSERT_EQ(1u, other_bucket.probes.size());
+  ASSERT_EQ(1u, other_index.probes.size());
+  EXPECT_NE(base.probes[0].oid.name, other_bucket.probes[0].oid.name);
+  EXPECT_NE(base.probes[0].oid.name, other_index.probes[0].oid.name);
+}
+
+TEST(VectorQueryPlanner, BitLshPlannerIsFutureWork) {
+  float query[] = {1.0, 2.0, 3.0, 4.0};
+  bufferlist query_bl;
+  query_bl.append(reinterpret_cast<const char *>(query), sizeof(query));
+
+  auto req = make_query_planner_request("bucket", "index", query_bl);
+  req.algorithm_id = ceph::rados::vector_query_algorithm_bit_lsh;
+
+  librados::vector_query::plan_t plan;
+  EXPECT_EQ(-EOPNOTSUPP, librados::vector_query::build_plan(req, &plan));
+  EXPECT_TRUE(plan.probes.empty());
 }
 
 TEST_F(LibRadosIoPP, TooBigPP) {
