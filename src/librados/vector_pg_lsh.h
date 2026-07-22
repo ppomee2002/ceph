@@ -11,6 +11,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -40,6 +41,11 @@ struct params_t {
   uint32_t hamming_radius = 0;
   uint32_t d = 0;
   uint32_t m = 0;
+  uint32_t object_distance_group_bits = 0;
+  uint32_t object_residual_bits = 0;
+  uint32_t object_distance_probe_radius = 0;
+  uint32_t object_residual_hamming_radius = 0;
+  std::vector<double> object_anchor;
 };
 
 struct locator_state_t {
@@ -54,6 +60,7 @@ struct put_target_t {
   std::string locator_key;
   std::string placement_key;
   std::string vector_hash;
+  std::string object_name;
 };
 
 struct query_probe_t {
@@ -63,6 +70,7 @@ struct query_probe_t {
   object_t oid;
   std::string locator_key;
   std::string placement_key;
+  std::string object_name;
 };
 
 struct query_op_state_t {
@@ -83,6 +91,9 @@ inline int validate_params(const params_t& params,
       params.hamming_radius > params.k ||
       params.d == 0 ||
       params.m == 0 ||
+      params.object_distance_group_bits > 16 ||
+      params.object_residual_bits > 16 ||
+      params.object_residual_hamming_radius > params.object_residual_bits ||
       pool_info.pg_num == 0 ||
       pool_info.pgp_num == 0) {
     return -EINVAL;
@@ -93,7 +104,29 @@ inline int validate_params(const params_t& params,
   if (params.d > params.l) {
     return -EINVAL;
   }
+  if (params.object_distance_group_bits == 0 &&
+      params.object_distance_probe_radius != 0) {
+    return -EINVAL;
+  }
   return 0;
+}
+
+inline int compute_sub_oid_object_key(
+    const ceph::bufferlist& vector_data,
+    uint32_t dimension,
+    const params_t& params,
+    vector_placement::pg_lsh_v0_object_key_t *object_key)
+{
+  if (params.object_anchor.empty()) {
+    return vector_placement::pg_lsh_v0_compute_object_key(
+        vector_data, dimension, params.seed,
+        params.object_distance_group_bits, params.object_residual_bits,
+        object_key);
+  }
+  return vector_placement::pg_lsh_v0_compute_object_key_with_anchor(
+      vector_data, dimension, params.seed,
+      params.object_distance_group_bits, params.object_residual_bits,
+      params.object_anchor, object_key);
 }
 
 class locator_cache_t {
@@ -299,6 +332,18 @@ inline int build_put_targets(const std::string& bucket_name,
 
   const std::string vector_hash =
     vector_placement::hash_v0_vector_hash(vector_data);
+  std::string object_name;
+  if (vector_placement::pg_lsh_v0_sub_oid_enabled(
+        params.object_distance_group_bits, params.object_residual_bits)) {
+    vector_placement::pg_lsh_v0_object_key_t object_key;
+    ret = compute_sub_oid_object_key(
+        vector_data, dimension, params, &object_key);
+    if (ret < 0) {
+      return ret;
+    }
+    object_name = std::move(object_key.object_name);
+  }
+
   targets->reserve(write_pgs.size());
   for (const uint32_t pg : write_pgs) {
     std::string locator_key;
@@ -308,10 +353,12 @@ inline int build_put_targets(const std::string& bucket_name,
     }
     targets->push_back({
       pg,
-      vector_placement::make_pg_lsh_v0_oid(bucket_name, index_name, pg),
+      vector_placement::make_pg_lsh_v0_oid(
+          bucket_name, index_name, pg, object_name),
       std::move(locator_key),
       vector_placement::pg_lsh_v0_placement_key(pg),
       vector_hash,
+      object_name,
     });
   }
   return 0;
@@ -349,22 +396,50 @@ inline int build_query_probes(const std::string& bucket_name,
     return ret;
   }
 
-  probes->reserve(ranked.size());
+  std::vector<std::string> object_names;
+  if (vector_placement::pg_lsh_v0_sub_oid_enabled(
+        params.object_distance_group_bits, params.object_residual_bits)) {
+    vector_placement::pg_lsh_v0_object_key_t object_key;
+    ret = compute_sub_oid_object_key(
+        query_vector, dimension, params, &object_key);
+    if (ret < 0) {
+      return ret;
+    }
+    ret = vector_placement::pg_lsh_v0_object_probe_names(
+        object_key, params.object_distance_group_bits,
+        params.object_residual_bits, params.object_distance_probe_radius,
+        params.object_residual_hamming_radius, &object_names);
+    if (ret < 0) {
+      return ret;
+    }
+  } else {
+    object_names.emplace_back();
+  }
+
+  probes->reserve(ranked.size() * object_names.size());
+  std::unordered_set<std::string> seen_oid_names;
   for (const auto& candidate : ranked) {
     std::string locator_key;
     ret = locator_cache->locator_for_pg(candidate.pg, &locator_key);
     if (ret < 0) {
       return ret;
     }
-    probes->push_back({
-      candidate.pg,
-      candidate.min_hamming_distance,
-      candidate.table_votes,
-      vector_placement::make_pg_lsh_v0_oid(
-          bucket_name, index_name, candidate.pg),
-      std::move(locator_key),
-      vector_placement::pg_lsh_v0_placement_key(candidate.pg),
-    });
+    for (const auto& object_name : object_names) {
+      object_t oid = vector_placement::make_pg_lsh_v0_oid(
+          bucket_name, index_name, candidate.pg, object_name);
+      if (!seen_oid_names.insert(oid.name).second) {
+        continue;
+      }
+      probes->push_back({
+        candidate.pg,
+        candidate.min_hamming_distance,
+        candidate.table_votes,
+        std::move(oid),
+        locator_key,
+        vector_placement::pg_lsh_v0_placement_key(candidate.pg),
+        object_name,
+      });
+    }
   }
   return 0;
 }
