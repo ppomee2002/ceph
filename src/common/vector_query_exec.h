@@ -350,7 +350,44 @@ inline void copy_bufferlist_bytes(const ceph::bufferlist& bl,
   p.copy(len, out);
 }
 
+inline int prepare_float32_query(const query_vectors_request_t& req,
+                                 std::vector<float> *query_values,
+                                 double *query_norm)
+{
+  if (query_values == nullptr || query_norm == nullptr) {
+    return -EINVAL;
+  }
+  const size_t expected_len =
+    static_cast<size_t>(req.dimension) * sizeof(float);
+  if (req.data_type != vector_data_type_float32 ||
+      req.query_vector.length() != expected_len) {
+    return -EINVAL;
+  }
+
+  query_values->resize(req.dimension);
+  copy_bufferlist_bytes(
+      req.query_vector,
+      reinterpret_cast<char*>(query_values->data()),
+      expected_len);
+
+  *query_norm = 0;
+  for (const float value : *query_values) {
+    *query_norm += static_cast<double>(value) * value;
+  }
+  return 0;
+}
+
+inline const char *contiguous_bufferlist_data(const ceph::bufferlist& bl)
+{
+  if (bl.length() == 0 || !bl.is_contiguous() || bl.get_num_buffers() == 0) {
+    return nullptr;
+  }
+  return bl.buffers().front().c_str();
+}
+
 inline int compute_float32_distance(const query_vectors_request_t& req,
+                                    const std::vector<float>& query_values,
+                                    double query_norm,
                                     const ceph::bufferlist& candidate,
                                     float *distance)
 {
@@ -360,24 +397,26 @@ inline int compute_float32_distance(const query_vectors_request_t& req,
   const size_t expected_len =
     static_cast<size_t>(req.dimension) * sizeof(float);
   if (req.data_type != vector_data_type_float32 ||
-      req.query_vector.length() != expected_len ||
+      query_values.size() != req.dimension ||
       candidate.length() != expected_len) {
     return -EINVAL;
   }
 
-  std::vector<char> query_data(expected_len);
-  std::vector<char> candidate_data(expected_len);
-  copy_bufferlist_bytes(req.query_vector, query_data.data(), expected_len);
-  copy_bufferlist_bytes(candidate, candidate_data.data(), expected_len);
+  std::vector<char> candidate_copy;
+  const char *candidate_data = contiguous_bufferlist_data(candidate);
+  if (candidate_data == nullptr) {
+    candidate_copy.resize(expected_len);
+    copy_bufferlist_bytes(candidate, candidate_copy.data(), expected_len);
+    candidate_data = candidate_copy.data();
+  }
+
   double dot = 0;
-  double query_norm = 0;
   double candidate_norm = 0;
   double sum_sq = 0;
   for (uint32_t i = 0; i < req.dimension; ++i) {
-    const double q = read_float32(query_data.data(), i);
-    const double c = read_float32(candidate_data.data(), i);
+    const double q = query_values[i];
+    const double c = read_float32(candidate_data, i);
     dot += q * c;
-    query_norm += q * q;
     candidate_norm += c * c;
     const double diff = q - c;
     sum_sq += diff * diff;
@@ -457,6 +496,55 @@ inline void sort_and_trim_results(std::vector<query_vectors_result_entry_t> *ent
   }
 }
 
+inline void add_local_topk_result(
+    std::vector<query_vectors_result_entry_t> *entries,
+    const query_vectors_result_entry_t& candidate,
+    uint32_t top_k,
+    bool *heapified)
+{
+  if (entries == nullptr || heapified == nullptr) {
+    return;
+  }
+  if (top_k == 0) {
+    entries->push_back(candidate);
+    return;
+  }
+
+  const size_t limit = top_k;
+  if (entries->size() < limit) {
+    entries->push_back(candidate);
+    if (entries->size() == limit) {
+      std::make_heap(entries->begin(), entries->end(), result_entry_better);
+      *heapified = true;
+    }
+    return;
+  }
+
+  if (result_entry_better(candidate, entries->front())) {
+    std::pop_heap(entries->begin(), entries->end(), result_entry_better);
+    entries->back() = candidate;
+    std::push_heap(entries->begin(), entries->end(), result_entry_better);
+  }
+}
+
+inline void finalize_local_topk_results(
+    std::vector<query_vectors_result_entry_t> *entries,
+    uint32_t top_k,
+    bool heapified)
+{
+  if (entries == nullptr) {
+    return;
+  }
+  if (heapified) {
+    std::sort_heap(entries->begin(), entries->end(), result_entry_better);
+  } else {
+    std::sort(entries->begin(), entries->end(), result_entry_better);
+  }
+  if (top_k != 0 && entries->size() > top_k) {
+    entries->resize(top_k);
+  }
+}
+
 inline int build_local_results(const query_vectors_request_t& req,
                                const omap_scan_state_t& scan,
                                query_vectors_result_t *result,
@@ -475,6 +563,14 @@ inline int build_local_results(const query_vectors_request_t& req,
     return r;
   }
 
+  std::vector<float> query_values;
+  double query_norm = 0;
+  r = prepare_float32_query(req, &query_values, &query_norm);
+  if (r < 0) {
+    return r;
+  }
+
+  bool local_heapified = false;
   for (const auto& [entry_id, entry] : scan.entries) {
     (void)entry_id;
     if (stats != nullptr) {
@@ -540,7 +636,8 @@ inline int build_local_results(const query_vectors_request_t& req,
     if (stats != nullptr) {
       stats->distance_computations++;
     }
-    r = compute_float32_distance(req, content->second, &distance);
+    r = compute_float32_distance(
+        req, query_values, query_norm, content->second, &distance);
     if (r < 0) {
       if (stats != nullptr) {
         stats->distance_error++;
@@ -555,13 +652,15 @@ inline int build_local_results(const query_vectors_request_t& req,
     result_entry.key = entry.user_key;
     result_entry.distance = distance;
     result_entry.entry_id = entry.entry_id;
-    merge_result_entry(&result->entries, result_entry);
+    add_local_topk_result(
+        &result->entries, result_entry, req.local_top_k, &local_heapified);
   }
 
   if (stats != nullptr) {
-    stats->merged_entries = result->entries.size();
+    stats->merged_entries = stats->matched_entries;
   }
-  sort_and_trim_results(&result->entries, req.local_top_k);
+  finalize_local_topk_results(
+      &result->entries, req.local_top_k, local_heapified);
   if (stats != nullptr) {
     stats->final_entries = result->entries.size();
   }
