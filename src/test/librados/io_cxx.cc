@@ -623,6 +623,47 @@ TEST(VectorPlacement, PgLshV0SelectionUsesLogicalOrderAndBudget) {
   EXPECT_LT(query_pgs.size(), exhausted_params.m);
 }
 
+TEST(VectorPlacement, PgLshV0ObjectNameUsesCoarseDistanceGroup) {
+  float vector[] = {1.0, 2.0, 0.0, -1.0};
+  bufferlist vector_bl;
+  vector_bl.append(reinterpret_cast<const char *>(vector), sizeof(vector));
+
+  librados::vector_placement::pg_lsh_v0_object_key_t key;
+  ASSERT_EQ(0, librados::vector_placement::pg_lsh_v0_compute_object_key(
+      vector_bl, 4, 12345, 4, 4, &key));
+  EXPECT_EQ(0x4bbe, key.distance16);
+  EXPECT_EQ(0x4, key.distance_group);
+  EXPECT_EQ(0x5, key.residual_code);
+  EXPECT_EQ("g4_r5", key.object_name);
+
+  std::vector<std::string> object_names;
+  ASSERT_EQ(0, librados::vector_placement::pg_lsh_v0_object_probe_names(
+      key, 4, 4, 1, 1, &object_names));
+  ASSERT_EQ(15u, object_names.size());
+  EXPECT_EQ("g4_r5", object_names[0]);
+
+  const std::unordered_set<std::string> names(
+      object_names.begin(), object_names.end());
+  EXPECT_EQ(object_names.size(), names.size());
+  EXPECT_EQ(1u, names.count("g3_r5"));
+  EXPECT_EQ(1u, names.count("g5_r5"));
+  EXPECT_EQ(1u, names.count("g4_r4"));
+
+  float axis_vector[] = {2.0, 0.0, 0.0, 0.0};
+  bufferlist axis_bl;
+  axis_bl.append(reinterpret_cast<const char *>(axis_vector),
+                 sizeof(axis_vector));
+  std::vector<double> axis_anchor = {1.0, 0.0, 0.0, 0.0};
+  ASSERT_EQ(0,
+            librados::vector_placement::
+            pg_lsh_v0_compute_object_key_with_anchor(
+                axis_bl, 4, 12345, 4, 4, axis_anchor, &key));
+  EXPECT_EQ(0x0000, key.distance16);
+  EXPECT_EQ(0x0, key.distance_group);
+  EXPECT_EQ(0xf, key.residual_code);
+  EXPECT_EQ("g0_rf", key.object_name);
+}
+
 TEST(VectorPlacement, PgLshV0ManualCollisionSelection) {
   constexpr uint32_t seed = 12345;
   constexpr uint32_t pg_num = 16;
