@@ -45,6 +45,7 @@ struct params_t {
   uint32_t object_residual_bits = 0;
   uint32_t object_distance_probe_radius = 0;
   uint32_t object_residual_hamming_radius = 0;
+  uint32_t object_probe_limit_per_pg = 0;
   std::vector<double> object_anchor;
 };
 
@@ -106,6 +107,11 @@ inline int validate_params(const params_t& params,
   }
   if (params.object_distance_group_bits == 0 &&
       params.object_distance_probe_radius != 0) {
+    return -EINVAL;
+  }
+  if (!vector_placement::pg_lsh_v0_sub_oid_enabled(
+        params.object_distance_group_bits, params.object_residual_bits) &&
+      params.object_probe_limit_per_pg != 0) {
     return -EINVAL;
   }
   return 0;
@@ -424,6 +430,7 @@ inline int build_query_probes(const std::string& bucket_name,
     if (ret < 0) {
       return ret;
     }
+    uint32_t emitted_for_pg = 0;
     for (const auto& object_name : object_names) {
       object_t oid = vector_placement::make_pg_lsh_v0_oid(
           bucket_name, index_name, candidate.pg, object_name);
@@ -439,6 +446,11 @@ inline int build_query_probes(const std::string& bucket_name,
         vector_placement::pg_lsh_v0_placement_key(candidate.pg),
         object_name,
       });
+      ++emitted_for_pg;
+      if (params.object_probe_limit_per_pg != 0 &&
+          emitted_for_pg >= params.object_probe_limit_per_pg) {
+        break;
+      }
     }
   }
   return 0;
