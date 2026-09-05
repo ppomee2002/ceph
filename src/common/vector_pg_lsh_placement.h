@@ -21,6 +21,26 @@
 // librados::vector_placement for existing callers.
 namespace ceph::rados::vector_pg_lsh_placement {
 
+// The distance geometry decides what a stored sub_oid's distance_bucket
+// measures, and so whether it shares a metric space with the query-side
+// tau from local_query_accumulator_t::current_tau(), which is always a raw
+// Euclidean distance over the vectors as stored.
+//
+// normalized_angular_v0 is the original geometry: distance_bucket encodes
+// ||v_hat-a_hat||^2 over L2-unit-normalized copies of the vector and
+// anchor (compute_sub_oid() in librados/vector_placement.h). That is not
+// the space tau lives in, so it can only feed best-first ordering, not
+// subtree exclusion; see query_vectors_tree_boundary() in seastore.cc.
+//
+// raw_euclidean_v1 encodes the raw ||v-anchor||^2 instead, quantized
+// against the persisted index_config_t::raw_distance_scale_max. Put
+// (compute_sub_oid()) and query
+// (compute_boundary_query_state_raw_euclidean()) use the same mapping, so
+// Dv, Dq and tau share units and tau-based exclusion is valid. It is a
+// separate placement_layout_version, so v0 indexes keep the v0 path.
+inline constexpr uint32_t distance_geometry_normalized_angular_v0 = 0;
+inline constexpr uint32_t distance_geometry_raw_euclidean_v1 = 1;
+
 inline uint32_t mix_u32(uint32_t value)
 {
   value ^= value >> 16;

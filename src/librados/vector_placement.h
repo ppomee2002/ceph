@@ -285,6 +285,14 @@ struct sub_oid_config_t {
   uint32_t distance_bucket_bits = 0;
   uint32_t residual_bits = 0;
   std::span<const double> anchor;
+  // One of common/vector_pg_lsh_placement.h's distance_geometry_*
+  // constants. Defaults to the v0 normalized-angular geometry, so callers
+  // that leave it alone keep the same placement.
+  uint32_t distance_geometry =
+    ceph::rados::vector_pg_lsh_placement::distance_geometry_normalized_angular_v0;
+  // Must be > 0 for distance_geometry_raw_euclidean_v1 and 0 otherwise;
+  // see index_config_t::raw_distance_scale_max.
+  double raw_distance_scale_max = 0;
 };
 
 struct probe_config_t {
@@ -341,6 +349,75 @@ inline int pg_lsh_v0_random_anchor(uint32_t dimension,
 
 namespace pg_lsh_v0 {
 
+// raw_euclidean_v1 placement: distance_bucket encodes the raw squared
+// Euclidean distance ||v-anchor||^2, quantized against
+// config.raw_distance_scale_max rather than the fixed [0,4] range the
+// normalized angular distance uses. That puts Dv here, Dq in
+// vector_pg_lsh_boundary.h, and tau from current_tau() in the same units,
+// which is what server-side tau-based pruning needs. A raw distance past
+// raw_distance_scale_max clamps into the top bucket instead of erroring,
+// so that bucket's pruning interval is unbounded above; see
+// distance_interval_from_bucket_range_raw_euclidean().
+inline int compute_sub_oid_raw_euclidean(
+    const std::vector<float>& values,
+    const sub_oid_config_t& config,
+    sub_oid_t *out_sub_oid)
+{
+  if (!(config.raw_distance_scale_max > 0) ||
+      !std::isfinite(config.raw_distance_scale_max)) {
+    return -EINVAL;
+  }
+  double Dv = 0;
+  std::vector<double> offset(values.size(), 0.0);
+  for (uint32_t dim = 0; dim < config.dimension; ++dim) {
+    if (!std::isfinite(config.anchor[dim])) {
+      return -EINVAL;
+    }
+    offset[dim] = static_cast<double>(values[dim]) - config.anchor[dim];
+    Dv += offset[dim] * offset[dim];
+  }
+
+  const double scaled_distance =
+    std::clamp(Dv / config.raw_distance_scale_max, 0.0, 1.0);
+  const auto quantized_anchor_distance = static_cast<uint32_t>(
+      std::floor(scaled_distance * 65535.0 + 0.5));
+
+  uint32_t distance_bucket = 0;
+  if (config.distance_bucket_bits != 0) {
+    distance_bucket =
+      quantized_anchor_distance >> (16 - config.distance_bucket_bits);
+  }
+
+  uint32_t residual_code = 0;
+  if (config.residual_bits != 0) {
+    // Unlike the normalized_angular_v0 residual below, this projects the
+    // raw offset (v-anchor) directly: there is no unit anchor direction to
+    // orthogonalize an unnormalized offset against. The Cauchy-Schwarz
+    // argument in compute_residual_wildcard_mask() still holds in raw
+    // units, since w is unit-norm: proj(v)-proj(q) == w.(v-q) and
+    // |w.(v-q)| <= ||v-q||, which is the same distance tau measures.
+    const uint32_t residual_seed = config.seed ^ 0xbb67ae85U;
+    const double inv_sqrt_dim =
+      1.0 / std::sqrt(static_cast<double>(config.dimension));
+    for (uint32_t bit = 0; bit < config.residual_bits; ++bit) {
+      double projection = 0;
+      for (uint32_t dim = 0; dim < config.dimension; ++dim) {
+        projection += offset[dim] *
+          static_cast<double>(
+              pg_lsh_v0_hyperplane_sign(residual_seed, 0, bit, dim)) *
+          inv_sqrt_dim;
+      }
+      if (projection >= 0) {
+        residual_code |= (uint32_t{1} << bit);
+      }
+    }
+  }
+
+  out_sub_oid->distance_bucket = static_cast<uint16_t>(distance_bucket);
+  out_sub_oid->residual_code = static_cast<uint16_t>(residual_code);
+  return 0;
+}
+
 inline int compute_sub_oid(
     const ceph::bufferlist& vector_data,
     const sub_oid_config_t& config,
@@ -355,18 +432,34 @@ inline int compute_sub_oid(
       config.anchor.size() != config.dimension) {
     return -EINVAL;
   }
+  if (config.distance_geometry !=
+        ceph::rados::vector_pg_lsh_placement::
+          distance_geometry_normalized_angular_v0 &&
+      config.distance_geometry !=
+        ceph::rados::vector_pg_lsh_placement::
+          distance_geometry_raw_euclidean_v1) {
+    return -EINVAL;
+  }
 
   std::vector<float> values;
   int r = copy_float32_vector(vector_data, config.dimension, &values);
   if (r < 0) {
     return r;
   }
-
-  double norm_sq = 0;
   for (const float value : values) {
     if (!std::isfinite(value)) {
       return -EINVAL;
     }
+  }
+
+  if (config.distance_geometry ==
+      ceph::rados::vector_pg_lsh_placement::distance_geometry_raw_euclidean_v1) {
+    return compute_sub_oid_raw_euclidean(values, config, out_sub_oid);
+  }
+
+  // ---- normalized_angular_v0 ----
+  double norm_sq = 0;
+  for (const float value : values) {
     norm_sq += static_cast<double>(value) * value;
   }
 

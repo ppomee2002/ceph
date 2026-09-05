@@ -1721,6 +1721,7 @@ SeaStore::Shard::query_vectors_tree_boundary(
   ++(shard_stats.pending_read_num);
 
   using namespace ceph::rados::vector_pg_lsh_boundary;
+  using ceph::rados::vector_pg_lsh_placement::distance_geometry_raw_euclidean_v1;
   const auto &tb = *request.tree_boundary_search;
 
   std::vector<float> query_values;
@@ -1729,8 +1730,15 @@ SeaStore::Shard::query_vectors_tree_boundary(
     --(shard_stats.pending_read_num);
     return crimson::ct_error::input_output_error::make();
   }
-  auto boundary_state = compute_boundary_query_state(
-      query_values, tb.anchor, tb.seed, tb.residual_bits);
+  const uint32_t geometry = tb.distance_geometry;
+  const double raw_scale = tb.raw_distance_scale_max;
+  const bool enable_pruning =
+    tb.enable_pruning && geometry == distance_geometry_raw_euclidean_v1;
+  auto boundary_state = geometry == distance_geometry_raw_euclidean_v1
+    ? compute_boundary_query_state_raw_euclidean(
+        query_values, tb.anchor, tb.seed, tb.residual_bits)
+    : compute_boundary_query_state(
+        query_values, tb.anchor, tb.seed, tb.residual_bits);
   if (!boundary_state) {
     --(shard_stats.pending_read_num);
     return crimson::ct_error::input_output_error::make();
@@ -1743,16 +1751,19 @@ SeaStore::Shard::query_vectors_tree_boundary(
   return seastar::do_with(
     ceph::rados::query_vectors_result_t(),
     anchor,
-    [this, ch, &request, Dq, bits, residual_bits, budget, FNAME]
+    [this, ch, &request, Dq, bits, residual_bits, budget, geometry,
+     raw_scale, enable_pruning, boundary_state, FNAME]
     (auto &result, auto &anchor) {
     return repeat_eagain([this, ch, &request, &result, Dq, bits,
-                          residual_bits, budget, &anchor, FNAME] {
+                          residual_bits, budget, geometry, raw_scale,
+                          enable_pruning, boundary_state, &anchor, FNAME] {
       ++(shard_stats.repeat_read_num);
       return transaction_manager->with_transaction_intr(
         Transaction::src_t::READ,
         "query_vectors_tree_boundary",
         CACHE_HINT_TOUCH,
         [this, ch, &request, &result, Dq, bits, residual_bits, budget,
+         geometry, raw_scale, enable_pruning, boundary_state,
          &anchor, FNAME](auto &t) -> base_iertr::future<> {
         return seastar::do_with(
           ceph::rados::vector_query_exec::local_query_accumulator_t(),
@@ -1763,6 +1774,7 @@ SeaStore::Shard::query_vectors_tree_boundary(
               "seastore_vector_node_list_block_bytes")),
           uint32_t(0),
           [this, &t, &request, &result, Dq, bits, residual_bits, budget,
+           geometry, raw_scale, enable_pruning, boundary_state,
            &anchor, FNAME]
               (auto &accumulator, auto &boundary_query, auto &manager,
                auto &expanded_count) -> base_iertr::future<> {
@@ -1770,60 +1782,60 @@ SeaStore::Shard::query_vectors_tree_boundary(
               return crimson::ct_error::input_output_error::make();
             }
 
-            // Priority is a pure best-first ORDERING heuristic over Dq
-            // (the query's own normalized, unit-L2 angular distance to
-            // the anchor -- see compute_boundary_query_state()) vs. each
-            // subtree's distance_bucket range. It deliberately never
-            // returns nullopt (never hard-excludes a subtree based on
-            // distance): distance_bound_from_tau()/bucket_range_overlaps_
-            // bound() would combine this Dq (normalized space) with the
-            // accumulator's tau, a raw, non-squared distance in whatever
-            // units the *stored* vectors' own magnitude happens to be in
-            // (compute_sub_oid() only normalizes a transient internal
-            // copy for bucket placement -- see
-            // librados/vector_placement.h -- the raw payload is what is
-            // stored and what tau is computed from). Nothing in this
-            // system guarantees stored/query vectors are unit-L2-
-            // normalized, so sqrt(Dq) +/- tau is not a provably valid
-            // exclusion bound in general: for euclidean it silently loses
-            // all pruning power when raw magnitudes are large relative to
-            // the [0,4] normalized range (as observed empirically against
-            // SIFT1M), but for a dataset with small raw magnitudes it
-            // could just as easily produce an overly *narrow* bound and
-            // incorrectly exclude a true candidate -- a correctness bug,
-            // not just a missed optimization. For cosine/dot, tau is not
-            // even a distance in the same sense at all (1-cos_sim, or
-            // -dot). Rather than gate this on an unverifiable "is the
-            // data unit-normalized" precondition, this tree-boundary path
-            // never uses tau for exclusion: min_possible_sq_distance(Dq,
-            // buckets, bits) alone is always mathematically valid for any
-            // distance_metric or vector scale, because it only compares
-            // Dq against a bucket range derived purely from sub_oid
-            // structure -- the same normalized angular-distance space
-            // compute_sub_oid() itself used to place every candidate.
-            // Used here only to choose exploration order; never a
-            // correctness bound. This does not touch the flat
-            // server_side_boundary_search path (build_bucket_range_bound()
-            // and friends in vector_pg_lsh_boundary.h), which still uses
-            // distance_bound_from_tau()/bucket_range_overlaps_bound() as
-            // before and is unchanged here.
-            auto make_priority = [Dq, bits, residual_bits] {
+            auto in_anchor_pg = [anchor](const ghobject_t &bound) {
+              return bound.shard_id == anchor.shard_id &&
+                     bound.hobj.pool == anchor.hobj.pool &&
+                     bound.hobj.get_hash() == anchor.hobj.get_hash();
+            };
+            auto make_priority = [Dq, bits, residual_bits, geometry, raw_scale,
+                                  enable_pruning, in_anchor_pg]
+                (std::optional<float> tau) {
               return crimson::os::seastore::tree_boundary_priority_fn_t(
-                [Dq, bits, residual_bits](
+                [Dq, bits, residual_bits, geometry, raw_scale,
+                 enable_pruning, in_anchor_pg, tau](
                     const std::optional<ghobject_t> &lower,
                     const std::optional<ghobject_t> &upper)
                     -> std::optional<double> {
+                  if (!lower || !upper ||
+                      !in_anchor_pg(*lower) || !in_anchor_pg(*upper)) {
+                    return std::nullopt;
+                  }
                   auto buckets = conservative_bucket_range_for_child(
                       lower, upper, bits, residual_bits);
+                  if (geometry == distance_geometry_raw_euclidean_v1) {
+                    if (enable_pruning && tau &&
+                        !bucket_range_overlaps_bound_raw_euclidean(
+                          buckets, bits, raw_scale,
+                          distance_bound_from_tau(Dq, *tau))) {
+                      return std::nullopt;
+                    }
+                    return min_possible_sq_distance_raw_euclidean(
+                        Dq, buckets, bits, raw_scale);
+                  }
                   return min_possible_sq_distance(Dq, buckets, bits);
                 });
             };
 
-            auto scan_one = [this, &t, &accumulator, &manager, &request, FNAME]
+            auto scan_one = [this, &t, &accumulator, &manager, &request,
+                             boundary_state, geometry, enable_pruning,
+                             bits, residual_bits, FNAME]
                 (const crimson::os::seastore::tree_boundary_candidate_t &cand)
                 -> base_iertr::future<> {
               if (!cand.onode->has_vector_index()) {
                 return base_iertr::now();
+              }
+              if (enable_pruning &&
+                  geometry == distance_geometry_raw_euclidean_v1 &&
+                  residual_bits != 0) {
+                auto tau = accumulator.current_tau();
+                auto sub_oid = split_anchor_sub_oid(
+                    cand.oid.hobj, bits, residual_bits);
+                if (tau && sub_oid &&
+                    !residual_matches(
+                      sub_oid->second.residual_code,
+                      compute_residual_wildcard_mask(*boundary_state, *tau))) {
+                  return base_iertr::now();
+                }
               }
               return manager.read_vector_node(
                 t, cand.onode->get_vector_index_laddr()
@@ -1851,7 +1863,8 @@ SeaStore::Shard::query_vectors_tree_boundary(
                 base_iertr::pass_further{});
             };
 
-            return boundary_query->primary(t, anchor, make_priority()
+            return boundary_query->primary(
+                t, anchor, make_priority(accumulator.current_tau())
             ).si_then([scan_one](auto candidates) {
               return seastar::do_with(
                 std::move(candidates), scan_one,
@@ -1876,7 +1889,8 @@ SeaStore::Shard::query_vectors_tree_boundary(
                   [this, &t, &boundary_query, &accumulator, make_priority,
                    scan_one, &expanded_count, FNAME]
                       (auto &has_more, auto &tau_before) {
-                  return boundary_query->expand_one(t, make_priority(), &has_more
+                  return boundary_query->expand_one(
+                      t, make_priority(tau_before), &has_more
                   ).si_then([this, &t, &accumulator, scan_one, &expanded_count,
                              &tau_before, FNAME]
                       (auto candidates) mutable

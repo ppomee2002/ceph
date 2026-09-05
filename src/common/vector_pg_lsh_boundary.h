@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -437,6 +438,177 @@ inline bool bucket_range_overlaps_bound(
 {
   const auto interval =
     distance_interval_from_bucket_range(buckets, distance_bucket_bits);
+  return interval.min <= bound.max && interval.max >= bound.min;
+}
+
+// ---------------------------------------------------------------------
+// Raw-Euclidean geometry (placement_layout_version
+// pg_lsh_layout_version_raw_euclidean_v1).
+//
+// Everything above assumes compute_sub_oid()'s normalized_angular_v0
+// placement, where distance_bucket encodes ||v_hat-a_hat||^2 over
+// unit-normalized copies of the vector and anchor. That is not the metric
+// space tau lives in, so combining that Dq with tau via
+// distance_bound_from_tau() does not give a valid exclusion bound, and
+// seastore.cc only uses those functions for best-first ordering.
+//
+// The functions below support raw_euclidean_v1 placement, where
+// distance_bucket encodes the raw ||v-anchor||^2, putting Dv, Dq and tau
+// in the same units. distance_bound_from_tau() is reused as is: it is
+// triangle-inequality algebra over whatever units Dq and tau share.
+// ---------------------------------------------------------------------
+
+// Raw-Euclidean counterpart of compute_boundary_query_state(): Dq =
+// ||q-anchor||^2 plus the residual hyperplane projections of (q-anchor),
+// without unit-normalizing either. Mirrors compute_sub_oid_raw_euclidean()
+// so it lands in the units placement used. The Cauchy-Schwarz argument in
+// that function's comment is what lets compute_residual_wildcard_mask() be
+// reused here unchanged.
+inline std::optional<boundary_query_state_t>
+compute_boundary_query_state_raw_euclidean(
+    const std::vector<float>& query_values,
+    const std::vector<double>& anchor,
+    uint32_t seed,
+    uint32_t residual_bits)
+{
+  if (query_values.empty() || query_values.size() != anchor.size()) {
+    return std::nullopt;
+  }
+  const uint32_t dimension = static_cast<uint32_t>(query_values.size());
+  for (const float v : query_values) {
+    if (!std::isfinite(v)) {
+      return std::nullopt;
+    }
+  }
+  for (const double v : anchor) {
+    if (!std::isfinite(v)) {
+      return std::nullopt;
+    }
+  }
+
+  double Dq = 0;
+  std::vector<double> offset(dimension, 0.0);
+  for (uint32_t i = 0; i < dimension; ++i) {
+    offset[i] = static_cast<double>(query_values[i]) - anchor[i];
+    Dq += offset[i] * offset[i];
+  }
+
+  boundary_query_state_t state;
+  state.Dq = Dq;
+  if (residual_bits != 0) {
+    const double inv_sqrt_dim =
+      1.0 / std::sqrt(static_cast<double>(dimension));
+    const uint32_t residual_seed = seed ^ 0xbb67ae85U;
+    state.query_bit_projection.assign(residual_bits, 0.0);
+    for (uint32_t bit = 0; bit < residual_bits; ++bit) {
+      double projection = 0;
+      for (uint32_t dim = 0; dim < dimension; ++dim) {
+        projection += offset[dim] *
+          static_cast<double>(
+              ceph::rados::vector_pg_lsh_placement::pg_lsh_v0_hyperplane_sign(
+                  residual_seed, 0, bit, dim)) *
+          inv_sqrt_dim;
+      }
+      state.query_bit_projection[bit] = projection;
+    }
+  }
+  return state;
+}
+
+// Raw-Euclidean counterpart of distance_interval_from_bucket_range().
+// Unlike the unit-vector angular distance, a raw squared distance has no
+// upper bound, and compute_sub_oid_raw_euclidean() clamps any Dv past
+// raw_distance_scale_max into the top bucket instead of failing. A
+// candidate in the top bucket can therefore have an arbitrarily large true
+// Dv, so the top bucket's upper edge is +infinity rather than the
+// configured scale. The bottom edge stays 0, as in the normalized case.
+inline distance_bound_t distance_interval_from_bucket_range_raw_euclidean(
+    const bucket_range_t& buckets,
+    uint32_t distance_bucket_bits,
+    double raw_distance_scale_max)
+{
+  if (distance_bucket_bits == 0) {
+    return {0.0, std::numeric_limits<double>::infinity()};
+  }
+  const uint32_t shift = 16 - distance_bucket_bits;
+  const uint32_t max_bucket = max_distance_bucket(distance_bucket_bits);
+  const uint32_t lo = std::min(buckets.lo, max_bucket);
+  const uint32_t hi = std::min(buckets.hi, max_bucket);
+  const double scaled_lo =
+    (static_cast<double>(lo) * (uint64_t{1} << shift)) / 65535.0;
+  const double min_bound =
+    std::clamp(scaled_lo, 0.0, 1.0) * raw_distance_scale_max;
+  if (hi >= max_bucket) {
+    return {min_bound, std::numeric_limits<double>::infinity()};
+  }
+  const uint64_t hi_q = std::min<uint64_t>(
+      65535ULL,
+      (static_cast<uint64_t>(hi) + 1) * (uint64_t{1} << shift) - 1);
+  const double scaled_hi = static_cast<double>(hi_q) / 65535.0;
+  return {min_bound,
+          std::clamp(scaled_hi, 0.0, 1.0) * raw_distance_scale_max};
+}
+
+// Raw-Euclidean counterpart of conservative_distance_bucket_range():
+// inverts compute_sub_oid_raw_euclidean()'s quantization to the widest
+// bucket range that could contain a candidate whose raw ||v-anchor||^2
+// falls in `bound`. A bound.max at or past scale_max maps to the top
+// bucket, matching the unbounded top bucket above. Rounds outward for the
+// same reason.
+inline bucket_range_t conservative_distance_bucket_range_raw_euclidean(
+    const distance_bound_t& bound,
+    uint32_t distance_bucket_bits,
+    double raw_distance_scale_max)
+{
+  if (distance_bucket_bits == 0 || !(raw_distance_scale_max > 0)) {
+    return {0, 0};
+  }
+  const double scaled_min =
+    std::clamp(bound.min / raw_distance_scale_max, 0.0, 1.0);
+  const double scaled_max =
+    std::isinf(bound.max)
+      ? 1.0
+      : std::clamp(bound.max / raw_distance_scale_max, 0.0, 1.0);
+  const uint32_t quantized_min = std::min<uint32_t>(
+      65535U, static_cast<uint32_t>(std::floor(scaled_min * 65535.0)));
+  const uint32_t quantized_max = std::min<uint32_t>(
+      65535U, static_cast<uint32_t>(std::ceil(scaled_max * 65535.0)));
+  const uint32_t shift = 16 - distance_bucket_bits;
+  return {quantized_min >> shift, quantized_max >> shift};
+}
+
+// Raw-Euclidean counterpart of min_possible_sq_distance(). Still only an
+// ordering key, but in raw units so it is comparable to this geometry's
+// Dq.
+inline double min_possible_sq_distance_raw_euclidean(
+    double Dq,
+    const bucket_range_t& buckets,
+    uint32_t distance_bucket_bits,
+    double raw_distance_scale_max)
+{
+  const auto interval = distance_interval_from_bucket_range_raw_euclidean(
+      buckets, distance_bucket_bits, raw_distance_scale_max);
+  if (Dq < interval.min) {
+    return interval.min - Dq;
+  } else if (Dq > interval.max) {
+    return Dq - interval.max;
+  }
+  return 0.0;
+}
+
+// Raw-Euclidean counterpart of bucket_range_overlaps_bound(), and the
+// exclusion test used by raw_euclidean_v1 tree-boundary pruning. False
+// when this subtree's raw-distance interval cannot contain a candidate
+// within the current tau-based bound; make_priority() in seastore.cc drops
+// the subtree outright in that case rather than deprioritizing it.
+inline bool bucket_range_overlaps_bound_raw_euclidean(
+    const bucket_range_t& buckets,
+    uint32_t distance_bucket_bits,
+    double raw_distance_scale_max,
+    const distance_bound_t& bound)
+{
+  const auto interval = distance_interval_from_bucket_range_raw_euclidean(
+      buckets, distance_bucket_bits, raw_distance_scale_max);
   return interval.min <= bound.max && interval.max >= bound.min;
 }
 
