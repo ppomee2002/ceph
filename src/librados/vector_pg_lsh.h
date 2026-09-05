@@ -41,6 +41,15 @@ inline constexpr uint32_t index_config_format_version = 1;
 // "v0" identifies the first immutable PG-LSH placement/routing layout. A
 // future incompatible mapping must use a new layout version and algorithm ID.
 inline constexpr uint32_t pg_lsh_layout_version = 0;
+// Second immutable layout. PG routing (k/l/d/seed) is identical to v0;
+// only sub_oid distance_bucket placement differs, using raw Euclidean
+// distance from the anchor instead of v0's normalized angular distance.
+// Tree-boundary pruning needs distance_bucket and tau in the same metric
+// space, which the normalized distance does not give. Requires
+// distance_metric == euclidean and raw_distance_scale_max > 0; see
+// validate_index_config(). v0 indexes keep their own layout version and
+// are not affected.
+inline constexpr uint32_t pg_lsh_layout_version_raw_euclidean_v1 = 1;
 
 inline constexpr uint32_t anchor_mode_random = 1;
 inline constexpr uint32_t anchor_mode_centroid = 2;
@@ -68,6 +77,10 @@ struct index_config_t {
   uint32_t residual_bits = 0;
   uint32_t anchor_mode = 0;
   std::vector<double> anchor;
+  // Quantization scale for the raw ||v-anchor||^2 -> distance_bucket
+  // mapping. Must be > 0 for the raw-Euclidean layout and 0 for v0; see
+  // validate_index_config(). Persisted so put and query agree on it.
+  double raw_distance_scale_max = 0;
 
   void encode(ceph::bufferlist& bl) const {
     ENCODE_START(1, 1, bl);
@@ -88,6 +101,7 @@ struct index_config_t {
     encode(residual_bits, bl);
     encode(anchor_mode, bl);
     encode(anchor, bl);
+    encode(raw_distance_scale_max, bl);
     ENCODE_FINISH(bl);
   }
 
@@ -110,6 +124,7 @@ struct index_config_t {
     decode(residual_bits, p);
     decode(anchor_mode, p);
     decode(anchor, p);
+    decode(raw_distance_scale_max, p);
     DECODE_FINISH(p);
   }
 };
@@ -132,6 +147,11 @@ struct query_params_t {
   // server_side_boundary_search above, which scans neighboring sub_oids
   // in a flat key range. The two are mutually exclusive.
   uint32_t tree_boundary_search_budget = 0;
+  // Skip subtrees that cannot hold a result within tau, rather than only
+  // reordering them. Requires tree_boundary_search_budget > 0 and the
+  // raw-Euclidean layout, the only one where distance_bucket and tau
+  // share a metric space. False keeps best-first ordering alone.
+  bool tree_boundary_search_prune = false;
 };
 
 // Query callers normally provide no immutable overrides. These optionals are
@@ -203,7 +223,9 @@ inline int validate_index_config(const index_config_t& config,
     set_mismatch_field(invalid_field, "placement_algorithm");
     return -EINVAL;
   }
-  if (config.placement_layout_version != pg_lsh_layout_version) {
+  if (config.placement_layout_version != pg_lsh_layout_version &&
+      config.placement_layout_version !=
+        pg_lsh_layout_version_raw_euclidean_v1) {
     set_mismatch_field(invalid_field, "placement_layout_version");
     return -EINVAL;
   }
@@ -276,6 +298,27 @@ inline int validate_index_config(const index_config_t& config,
     set_mismatch_field(invalid_field, "anchor");
     return -EINVAL;
   }
+  if (config.placement_layout_version ==
+      pg_lsh_layout_version_raw_euclidean_v1) {
+    // tau is Euclidean regardless of distance_metric, so it only matches
+    // the metric this index ranks by when that metric is euclidean.
+    // Reject cosine/dot here rather than mis-scoring at query time.
+    if (config.distance_metric != ceph::rados::vector_distance_metric_euclidean) {
+      set_mismatch_field(invalid_field, "distance_metric");
+      return -EINVAL;
+    }
+    if (!(config.raw_distance_scale_max > 0) ||
+        !std::isfinite(config.raw_distance_scale_max)) {
+      set_mismatch_field(invalid_field, "raw_distance_scale_max");
+      return -EINVAL;
+    }
+  } else if (config.raw_distance_scale_max != 0) {
+    // v0's normalized angular geometry has no scale parameter, so a
+    // nonzero value here usually means the caller forgot to set
+    // placement_layout_version.
+    set_mismatch_field(invalid_field, "raw_distance_scale_max");
+    return -EINVAL;
+  }
   if (config.d > pool_info.pg_num) {
     set_mismatch_field(invalid_field, "d");
     return -EINVAL;
@@ -339,6 +382,20 @@ inline int validate_query_params(const index_config_t& config,
     set_mismatch_field(invalid_field, "tree_boundary_search_budget");
     return -EINVAL;
   }
+  if (query_params.tree_boundary_search_prune) {
+    if (query_params.tree_boundary_search_budget == 0) {
+      set_mismatch_field(invalid_field, "tree_boundary_search_prune");
+      return -EINVAL;
+    }
+    if (config.placement_layout_version !=
+        pg_lsh_layout_version_raw_euclidean_v1) {
+      // Pruning needs distance_bucket and tau in the same metric space,
+      // which only the raw-Euclidean layout provides. Reject rather than
+      // falling back to best-first-only on the OSD.
+      set_mismatch_field(invalid_field, "tree_boundary_search_prune");
+      return -EINVAL;
+    }
+  }
   return 0;
 }
 
@@ -375,6 +432,7 @@ inline int compare_index_configs(const index_config_t& requested,
   CHECK_INDEX_CONFIG_FIELD(residual_bits);
   CHECK_INDEX_CONFIG_FIELD(anchor_mode);
   CHECK_INDEX_CONFIG_FIELD(anchor);
+  CHECK_INDEX_CONFIG_FIELD(raw_distance_scale_max);
 #undef CHECK_INDEX_CONFIG_FIELD
   if (mismatch_field != nullptr) {
     mismatch_field->clear();
@@ -441,6 +499,10 @@ inline vector_placement::pg_lsh_v0::sub_oid_config_t sub_oid_config_view(
     config.distance_bucket_bits,
     config.residual_bits,
     std::span<const double>(config.anchor),
+    config.placement_layout_version == pg_lsh_layout_version_raw_euclidean_v1
+      ? ceph::rados::vector_pg_lsh_placement::distance_geometry_raw_euclidean_v1
+      : ceph::rados::vector_pg_lsh_placement::distance_geometry_normalized_angular_v0,
+    config.raw_distance_scale_max,
   };
 }
 
@@ -928,6 +990,12 @@ inline void apply_tree_boundary_search_config(
   tree_boundary.distance_bucket_bits = config.distance_bucket_bits;
   tree_boundary.residual_bits = config.residual_bits;
   tree_boundary.budget = query_params.tree_boundary_search_budget;
+  tree_boundary.distance_geometry =
+    config.placement_layout_version == pg_lsh_layout_version_raw_euclidean_v1
+      ? ceph::rados::vector_pg_lsh_placement::distance_geometry_raw_euclidean_v1
+      : ceph::rados::vector_pg_lsh_placement::distance_geometry_normalized_angular_v0;
+  tree_boundary.raw_distance_scale_max = config.raw_distance_scale_max;
+  tree_boundary.enable_pruning = query_params.tree_boundary_search_prune;
   req->tree_boundary_search = std::move(tree_boundary);
 }
 

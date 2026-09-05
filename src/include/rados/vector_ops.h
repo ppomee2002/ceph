@@ -261,6 +261,9 @@ struct vector_tree_boundary_search_config_t {
   // frontier entry can no longer improve the running tau, whichever comes
   // first.
   uint32_t budget = 0;
+  uint32_t distance_geometry = 0;
+  double raw_distance_scale_max = 0;
+  bool enable_pruning = false;
 
   void encode(ceph::bufferlist& bl) const {
     ENCODE_START(1, 1, bl);
@@ -270,6 +273,9 @@ struct vector_tree_boundary_search_config_t {
     encode(distance_bucket_bits, bl);
     encode(residual_bits, bl);
     encode(budget, bl);
+    encode(distance_geometry, bl);
+    encode(raw_distance_scale_max, bl);
+    encode(enable_pruning, bl);
     ENCODE_FINISH(bl);
   }
 
@@ -281,6 +287,9 @@ struct vector_tree_boundary_search_config_t {
     decode(distance_bucket_bits, p);
     decode(residual_bits, p);
     decode(budget, p);
+    decode(distance_geometry, p);
+    decode(raw_distance_scale_max, p);
+    decode(enable_pruning, p);
     DECODE_FINISH(p);
   }
 };
