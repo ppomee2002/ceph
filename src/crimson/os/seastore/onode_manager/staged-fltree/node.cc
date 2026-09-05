@@ -25,6 +25,38 @@ const void* ptr(const ::boost::intrusive_ptr<T>& p) {
 }
 
 namespace crimson::os::seastore::onode {
+
+namespace {
+
+// Compares a search key against a stored separator key on the STAGE_LEFT
+// component only (shard/pool/crush). That component is precisely an N0
+// node's own slot key -- stages/node_stage_layout.h declares
+// `slot_0_t = _slot_t<shard_pool_crush_t, field_type_t::N0>` -- so "these
+// compare equal" means "same STAGE_LEFT slot", which for the onode tree is
+// one logical PG (all of a PG's objects share one locator and therefore
+// one crush hash). Returns <0 when the search key's band sorts before the
+// separator's, 0 for the same band, >0 for after.
+int compare_left_band(const key_hobj_t &key, const key_view_t &sep)
+{
+  std::strong_ordering c = std::strong_ordering::equal;
+  if (sep.has_shard_pool()) {
+    c = key <=> shard_pool_crush_t{sep.shard_pool_packed(), sep.crush_packed()};
+  } else {
+    // A node compressed past shard/pool (N1+) stores only crush per slot.
+    // Never produced at runtime today, but the comparison stays correct
+    // if that ever changes.
+    c = key <=> sep.crush_packed();
+  }
+  if (c < 0) {
+    return -1;
+  }
+  if (c > 0) {
+    return 1;
+  }
+  return 0;
+}
+
+} // anonymous namespace
 /*
  * tree_cursor_t
  */
@@ -1390,6 +1422,125 @@ InternalNode::get_next_child_range(context_t c, const search_position_t& pos)
   });
 }
 
+void InternalNode::enumerate_left_slot(
+    const key_hobj_t &key,
+    const search_position_t &from,
+    unsigned limit,
+    std::vector<child_probe_t> &out,
+    bool *truncated) const
+{
+  out.clear();
+  if (truncated) {
+    *truncated = false;
+  }
+  if (impl->is_keys_empty()) {
+    // Only the tail child exists; it necessarily covers every key.
+    if (impl->is_level_tail()) {
+      out.push_back({search_position_t::end(), std::nullopt, std::nullopt,
+                     false});
+    }
+    return;
+  }
+
+  // Step 1 -- back up to the first child that can still hold one of
+  // `key`'s band. Separators are sorted with the STAGE_LEFT component
+  // first, so their bands are non-decreasing: the moment a previous
+  // separator's band sorts strictly below the key's, every earlier one
+  // does too and the walk can stop. The walk length is therefore bounded
+  // by the size of this one slot, not by the node's fanout.
+  search_position_t start = from;
+  if (start.is_end()) {
+    // `from` is this node's tail child, which has no stored separator to
+    // compare; step onto the largest stored slot and let the forward pass
+    // below decide whether that child qualifies.
+    impl->get_largest_slot(&start, nullptr, nullptr);
+  }
+  while (start != search_position_t::begin()) {
+    search_position_t prev = start;
+    // get_prev_slot()/get_next_slot() abort unless a value out-param is
+    // supplied -- see node_layout.h's "not implemented" branches. The
+    // address is unused here; separator keys come from get_slot().
+    const laddr_packed_t *unused_addr = nullptr;
+    impl->get_prev_slot(prev, nullptr, &unused_addr);
+    key_view_t sep;
+    impl->get_slot(prev, &sep, nullptr);
+    if (compare_left_band(key, sep) > 0) {
+      break;
+    }
+    start = prev;
+  }
+
+  // Step 2 -- walk forward. A child covering (lower_excl, upper_incl] can
+  // hold a key of this band iff band(lower_excl) <= band(key) <=
+  // band(upper_incl), reading a missing bound as -/+infinity. Once a
+  // separator's band sorts strictly above the key's, no later child can
+  // qualify, so that child is the last one enumerated.
+  search_position_t pos = start;
+  int c_prev = 1;  // -infinity lower bound for the first slot
+  std::optional<ghobject_t> lower;
+  if (start != search_position_t::begin()) {
+    search_position_t prev = start;
+    // get_prev_slot()/get_next_slot() abort unless a value out-param is
+    // supplied -- see node_layout.h's "not implemented" branches. The
+    // address is unused here; separator keys come from get_slot().
+    const laddr_packed_t *unused_addr = nullptr;
+    impl->get_prev_slot(prev, nullptr, &unused_addr);
+    key_view_t sep;
+    impl->get_slot(prev, &sep, nullptr);
+    c_prev = compare_left_band(key, sep);
+    lower = sep.to_ghobj();
+  }
+  while (true) {
+    if (out.size() >= limit) {
+      if (truncated) {
+        *truncated = true;
+      }
+      return;
+    }
+    int c_cur = -1;  // +infinity upper bound for the tail child
+    std::optional<ghobject_t> upper;
+    if (!pos.is_end()) {
+      key_view_t sep;
+      impl->get_slot(pos, &sep, nullptr);
+      c_cur = compare_left_band(key, sep);
+      upper = sep.to_ghobj();
+    }
+    if (c_prev >= 0 && c_cur <= 0) {
+      out.push_back({pos, lower, upper, c_cur == 0});
+    }
+    if (c_cur < 0 || pos.is_end()) {
+      return;
+    }
+    search_position_t next = pos;
+    const laddr_packed_t *unused_next_addr = nullptr;
+    impl->get_next_slot(next, nullptr, &unused_next_addr);
+    if (next.is_end() && !impl->is_level_tail()) {
+      return;
+    }
+    c_prev = c_cur;
+    lower = upper;
+    pos = next;
+  }
+}
+
+eagain_ifuture<InternalNode::child_range_t> InternalNode::materialize_child(
+    context_t c, const child_probe_t &probe)
+{
+  Ref<Node> this_ref = this;
+  const laddr_packed_t *p_addr = nullptr;
+  if (probe.pos.is_end()) {
+    assert(impl->is_level_tail());
+    p_addr = impl->get_tail_value();
+  } else {
+    impl->get_slot(probe.pos, nullptr, &p_addr);
+  }
+  return get_or_track_child(c, probe.pos, p_addr->value
+  ).si_then([this_ref, probe](auto child) {
+    return child_range_t{child, probe.pos, probe.lower_excl,
+                         probe.upper_incl};
+  });
+}
+
 eagain_ifuture<Ref<InternalNode>> InternalNode::allocate_root(
     context_t c, laddr_hint_t hint, level_t old_root_level,
     laddr_t old_root_addr, Super::URef&& super)
@@ -2037,6 +2188,26 @@ LeafNode::get_next_entry_local(const search_position_t& pos)
   return entry_t{
       get_or_track_cursor(next_pos, next_key_view, p_value_header),
       next_key_view.to_ghobj()};
+}
+
+eagain_ifuture<std::optional<InternalNode::child_range_t>>
+LeafNode::get_prev_sibling_range(context_t c)
+{
+  if (is_root()) {
+    return eagain_iertr::make_ready_future<
+        std::optional<InternalNode::child_range_t>>(std::nullopt);
+  }
+  return parent_info().ptr->get_prev_child_range(c, parent_info().position);
+}
+
+eagain_ifuture<std::optional<InternalNode::child_range_t>>
+LeafNode::get_next_sibling_range(context_t c)
+{
+  if (is_root()) {
+    return eagain_iertr::make_ready_future<
+        std::optional<InternalNode::child_range_t>>(std::nullopt);
+  }
+  return parent_info().ptr->get_next_child_range(c, parent_info().position);
 }
 
 template <bool FORCE_MERGE>

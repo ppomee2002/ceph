@@ -560,6 +560,51 @@ class InternalNode final : public Node {
   eagain_ifuture<std::optional<child_range_t>> get_next_child_range(
       context_t, const search_position_t& pos);
 
+  /**
+   * child_probe_t / enumerate_left_slot()
+   *
+   * A child's key range read from this node's separator keys, without
+   * loading the child extent. Same (lower_excl, upper_incl] convention as
+   * child_range_t; `pos.is_end()` is the level-tail child, whose
+   * upper_incl is nullopt.
+   *
+   * enumerate_left_slot() returns the children that can hold a key sharing
+   * `key`'s STAGE_LEFT component (shard/pool/crush). An N0 node's slot key
+   * is shard_pool_crush_t (stages/node_stage_layout.h's slot_0_t) and
+   * separators sort on that component first, so those children are a
+   * contiguous run. A child at `pos` qualifies when its lower bound's band
+   * is <= the key's and its upper bound's band >=, which admits the run of
+   * children whose separator is in the slot plus the one immediately
+   * after: a separator is the largest key of the child below it, so that
+   * child holds the tail of the run even though its own separator belongs
+   * to the next band.
+   *
+   * Synchronous; it only reads separators from this node's resident
+   * extent. Callers materialize the probes they want via
+   * materialize_child().
+   */
+  struct child_probe_t {
+    search_position_t pos;
+    std::optional<ghobject_t> lower_excl;
+    std::optional<ghobject_t> upper_incl;
+    /// True when this node stores a separator for `pos` in the enumerated
+    /// key's STAGE_LEFT band. False for the trailing and tail children,
+    /// which are included because they can hold the end of the run.
+    bool in_slot = false;
+  };
+
+  void enumerate_left_slot(
+      const key_hobj_t& key,
+      const search_position_t& from,
+      unsigned limit,
+      std::vector<child_probe_t>& out,
+      bool* truncated = nullptr) const;
+
+  /// Loads the child a child_probe_t refers to, as the same child_range_t
+  /// the get_*_child_range() helpers return.
+  eagain_ifuture<child_range_t> materialize_child(
+      context_t, const child_probe_t& probe);
+
   /// lookup_largest() above asserts is_level_tail() and so only works on a
   /// node that is its parent's tail child. This works on any InternalNode:
   /// it descends into the tail child when there is one and the last stored
@@ -697,6 +742,22 @@ class LeafNode final : public Node {
 
   std::optional<entry_t> get_prev_entry_local(const search_position_t& pos);
   std::optional<entry_t> get_next_entry_local(const search_position_t& pos);
+
+  /**
+   * Previous/next sibling of this leaf under its own parent, with that
+   * sibling's key range. nullopt when this leaf is the root or is its
+   * parent's first or tail child, since the neighbor then lives under the
+   * grandparent and this lookup only goes up one level.
+   *
+   * Forwarders to InternalNode::get_prev_child_range()/
+   * get_next_child_range(), so a caller outside the Node hierarchy can
+   * continue a key-order traversal past this page, which
+   * get_prev_entry_local()/get_next_entry_local() above will not do.
+   */
+  eagain_ifuture<std::optional<InternalNode::child_range_t>>
+  get_prev_sibling_range(context_t);
+  eagain_ifuture<std::optional<InternalNode::child_range_t>>
+  get_next_sibling_range(context_t);
 
   /**
    * erase

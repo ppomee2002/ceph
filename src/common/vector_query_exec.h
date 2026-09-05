@@ -741,6 +741,26 @@ private:
     result_entry.key = entry.user_key;
     result_entry.distance = distance;
     result_entry.entry_id = entry.entry_id;
+
+    // The put path is append-only (see append_vector_entry() in
+    // vector_node.h) and entry_id is derived from
+    // bucket_name/index_name/key, so one logical vector can have several
+    // physical records. Without this check each copy takes its own top-k
+    // slot, cutting the number of distinct vectors retained, and lets a
+    // duplicate count towards heapified/current_tau() so tree-boundary
+    // expansion stops before local_top_k unique vectors are found.
+    for (auto& existing : entries) {
+      if (existing.entry_id == result_entry.entry_id) {
+        if (is_better_query_result(result_entry, existing)) {
+          existing = result_entry;
+          if (heapified) {
+            std::make_heap(entries.begin(), entries.end(),
+                           is_better_query_result);
+          }
+        }
+        return;
+      }
+    }
     retain_local_topk_result(
         &entries, result_entry, req.local_top_k, &heapified);
   }
