@@ -127,6 +127,11 @@ struct query_params_t {
   // residual_hamming_radius to be 0, since running both would scan
   // overlapping key space. PG selection is unaffected.
   bool server_side_boundary_search = false;
+  // Max additional FLTree subtrees the OSD may expand beyond the primary
+  // path, visited best-first; 0 disables it. Separate mechanism from
+  // server_side_boundary_search above, which scans neighboring sub_oids
+  // in a flat key range. The two are mutually exclusive.
+  uint32_t tree_boundary_search_budget = 0;
 };
 
 // Query callers normally provide no immutable overrides. These optionals are
@@ -326,6 +331,13 @@ inline int validate_query_params(const index_config_t& config,
       set_mismatch_field(invalid_field, "server_side_boundary_search");
       return -EINVAL;
     }
+  }
+  if (query_params.tree_boundary_search_budget != 0 &&
+      query_params.server_side_boundary_search) {
+    // Two independent boundary-search mechanisms; never combine them on
+    // the same query.
+    set_mismatch_field(invalid_field, "tree_boundary_search_budget");
+    return -EINVAL;
   }
   return 0;
 }
@@ -894,6 +906,29 @@ inline void apply_boundary_search_config(
   boundary.distance_bucket_bits = config.distance_bucket_bits;
   boundary.residual_bits = config.residual_bits;
   req->boundary_search = std::move(boundary);
+}
+
+// Same as apply_boundary_search_config() above, for the independent
+// tree-traversal mechanism.
+inline void apply_tree_boundary_search_config(
+    const index_config_t& config,
+    const query_params_t& query_params,
+    ceph::rados::query_vectors_request_t *req)
+{
+  if (req == nullptr) {
+    return;
+  }
+  if (query_params.tree_boundary_search_budget == 0) {
+    req->tree_boundary_search.reset();
+    return;
+  }
+  ceph::rados::vector_tree_boundary_search_config_t tree_boundary;
+  tree_boundary.anchor = config.anchor;
+  tree_boundary.seed = config.seed;
+  tree_boundary.distance_bucket_bits = config.distance_bucket_bits;
+  tree_boundary.residual_bits = config.residual_bits;
+  tree_boundary.budget = query_params.tree_boundary_search_budget;
+  req->tree_boundary_search = std::move(tree_boundary);
 }
 
 inline int verify_probe_locator(v14_2_0::IoCtx& ioctx,

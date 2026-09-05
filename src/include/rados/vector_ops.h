@@ -243,6 +243,48 @@ struct vector_boundary_search_config_t {
   }
 };
 
+// pg-lsh-v0 parameters for best-first traversal over FLTree subtree
+// ranges; see common/vector_pg_lsh_boundary.h and seastore.cc's
+// query_vectors(). Separate from vector_boundary_search_config_t above
+// because it is a different mechanism -- OSD-side tree descent with a
+// global frontier rather than a flat sub_oid range scan -- and the two are
+// never combined in one request.
+struct vector_tree_boundary_search_config_t {
+  // Same meaning as in vector_boundary_search_config_t: Dq, plus decoding
+  // a subtree's key range into a distance_bucket range.
+  std::vector<double> anchor;
+  uint32_t seed = 0;
+  uint32_t distance_bucket_bits = 0;
+  uint32_t residual_bits = 0;
+  // Max additional subtrees, beyond the primary path, the OSD may expand
+  // for this query. Traversal stops on this budget or when the next
+  // frontier entry can no longer improve the running tau, whichever comes
+  // first.
+  uint32_t budget = 0;
+
+  void encode(ceph::bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    using ceph::encode;
+    encode(anchor, bl);
+    encode(seed, bl);
+    encode(distance_bucket_bits, bl);
+    encode(residual_bits, bl);
+    encode(budget, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(ceph::bufferlist::const_iterator& p) {
+    DECODE_START(1, p);
+    using ceph::decode;
+    decode(anchor, p);
+    decode(seed, p);
+    decode(distance_bucket_bits, p);
+    decode(residual_bits, p);
+    decode(budget, p);
+    DECODE_FINISH(p);
+  }
+};
+
 struct query_vectors_request_t {
   // Logical vector bucket name.
   std::string bucket_name;
@@ -265,6 +307,10 @@ struct query_vectors_request_t {
   // Set only for pg-lsh-v0 boundary-aware search. Absent means one ONode
   // and no server-side expansion.
   std::optional<vector_boundary_search_config_t> boundary_search;
+  // Set only for tree traversal (see
+  // vector_tree_boundary_search_config_t). A client never sets it together
+  // with boundary_search, but the two encode independently.
+  std::optional<vector_tree_boundary_search_config_t> tree_boundary_search;
 
   void encode(ceph::bufferlist& bl) const {
     ENCODE_START(1, 1, bl);
@@ -281,6 +327,11 @@ struct query_vectors_request_t {
     encode(has_boundary_search, bl);
     if (has_boundary_search) {
       boundary_search->encode(bl);
+    }
+    const bool has_tree_boundary_search = tree_boundary_search.has_value();
+    encode(has_tree_boundary_search, bl);
+    if (has_tree_boundary_search) {
+      tree_boundary_search->encode(bl);
     }
     ENCODE_FINISH(bl);
   }
@@ -303,6 +354,14 @@ struct query_vectors_request_t {
       vector_boundary_search_config_t boundary;
       boundary.decode(p);
       boundary_search = std::move(boundary);
+    }
+    tree_boundary_search.reset();
+    bool has_tree_boundary_search = false;
+    decode(has_tree_boundary_search, p);
+    if (has_tree_boundary_search) {
+      vector_tree_boundary_search_config_t tree_boundary;
+      tree_boundary.decode(p);
+      tree_boundary_search = std::move(tree_boundary);
     }
     DECODE_FINISH(p);
   }

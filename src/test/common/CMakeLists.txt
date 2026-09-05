@@ -249,6 +249,13 @@ add_executable(unittest_vector_pg_lsh_boundary
 add_ceph_unittest(unittest_vector_pg_lsh_boundary)
 target_link_libraries(unittest_vector_pg_lsh_boundary ceph-common)
 
+# unittest_vector_query_exec
+add_executable(unittest_vector_query_exec
+  test_vector_query_exec.cc
+  )
+add_ceph_unittest(unittest_vector_query_exec)
+target_link_libraries(unittest_vector_query_exec ceph-common)
+
 # unittest_interval_map
 add_executable(unittest_interval_map
   test_interval_map.cc

@@ -425,6 +425,89 @@ using OnodeTree = Btree<FLTreeOnode>;
 
 using crimson::common::get_conf;
 
+/**
+ * FLTreeTreeBoundaryQuery
+ *
+ * FLTree's implementation of crimson::os::seastore::TreeBoundaryQuery
+ * (see onode_manager.h). Drives InternalNode::get_primary_child_range()/
+ * get_prev_child_range()/get_next_child_range() and LeafNode's analogous
+ * primitives directly; the caller-supplied `priority` function is the
+ * only place vector/distance-specific logic exists.
+ *
+ * Sibling subtrees discovered along the primary descent are pushed onto
+ * one global `frontier`. expand_one() re-evaluates every pending entry
+ * against the caller's current `priority` (dropping any it now rejects --
+ * tau only narrows over one query, so a rejected entry can never become
+ * admissible again), pops the single lowest-priority survivor, then
+ * descends *into* it via descend_best(): at each internal level, every
+ * child of the current node is evaluated, the lowest-priority admissible
+ * child is descended into, and every other admissible child is pushed
+ * onto the same global frontier -- so a nested sibling discovered deep
+ * inside an already-accepted alternate subtree competes on equal footing
+ * with everything else still pending, not just the ones found along the
+ * original primary path. This repeats level by level until a leaf is
+ * reached, where leaf-local candidate enumeration proceeds exactly as it
+ * does for the primary path.
+ */
+class FLTreeTreeBoundaryQuery final : public crimson::os::seastore::TreeBoundaryQuery {
+public:
+  explicit FLTreeTreeBoundaryQuery(OnodeTree &tree) : tree(tree) {}
+
+  ret primary(
+    Transaction &t,
+    const ghobject_t &anchor,
+    crimson::os::seastore::tree_boundary_priority_fn_t priority) final;
+
+  ret expand_one(
+    Transaction &t,
+    crimson::os::seastore::tree_boundary_priority_fn_t priority,
+    bool *has_more) final;
+
+private:
+  struct frontier_entry_t {
+    Ref<Node> node;
+    std::optional<ghobject_t> lower_excl;
+    std::optional<ghobject_t> upper_incl;
+  };
+
+  OnodeTree &tree;
+  std::vector<frontier_entry_t> frontier;
+
+  static eagain_ifuture<Ref<Node>> descend_primary(
+    context_t c,
+    Ref<Node> node,
+    const key_hobj_t &key,
+    MatchHistory &history,
+    const crimson::os::seastore::tree_boundary_priority_fn_t &priority,
+    std::vector<frontier_entry_t> &frontier);
+
+  /// Best-first descent through an already-selected subtree: at each
+  /// internal level, evaluates every child of `node` via `priority`,
+  /// descends into the lowest-priority admissible one, and pushes every
+  /// other admissible child onto `frontier`. Returns the leaf eventually
+  /// reached, or nullptr if some level had no admissible child at all
+  /// (the now-current, narrower `priority` bound rejected everything --
+  /// not an error, just nothing left to collect from this subtree).
+  /// Reuses only InternalNode::get_prev_child_range()/
+  /// get_next_child_range() (both already existing, position-relative,
+  /// vector-agnostic primitives); no new Node/InternalNode primitive is
+  /// added for this.
+  static eagain_ifuture<Ref<Node>> descend_best(
+    context_t c,
+    Ref<Node> node,
+    const crimson::os::seastore::tree_boundary_priority_fn_t &priority,
+    std::vector<frontier_entry_t> &frontier);
+
+  static void collect_leaf_local(
+    LeafNode &leaf,
+    const search_position_t &start_pos,
+    const ghobject_t &start_key,
+    const crimson::os::seastore::tree_boundary_priority_fn_t &priority,
+    std::vector<ghobject_t> &out_oids);
+
+  ret materialize(Transaction &t, std::vector<ghobject_t> oids);
+};
+
 class FLTreeOnodeManager : public crimson::os::seastore::OnodeManager {
   OnodeTree tree;
 
@@ -465,6 +548,10 @@ public:
     const ghobject_t& start,
     const ghobject_t& end,
     uint64_t limit) final;
+
+  crimson::os::seastore::TreeBoundaryQueryRef create_tree_boundary_query() final {
+    return std::make_unique<FLTreeTreeBoundaryQuery>(tree);
+  }
 
   ~FLTreeOnodeManager();
 };

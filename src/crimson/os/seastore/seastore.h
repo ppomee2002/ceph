@@ -351,6 +351,19 @@ public:
       });
     }
 
+    // Best-first tree traversal, reached from query_vectors() only when
+    // request.tree_boundary_search is set. See TreeBoundaryQuery in
+    // onode_manager.h and common/vector_pg_lsh_boundary.h. Shares no code
+    // path with the flat sub_oid range scan or with the plain single-onode
+    // query_vectors() below.
+    read_errorator::future<
+      std::optional<ceph::rados::query_vectors_result_t>>
+    query_vectors_tree_boundary(
+      CollectionRef c,
+      const ghobject_t& anchor,
+      const ceph::rados::query_vectors_request_t& request,
+      uint32_t op_flags);
+
     friend class SeaStoreOmapIterator;
 
     base_iertr::future<ceph::bufferlist> _read( 
