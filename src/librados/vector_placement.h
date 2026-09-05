@@ -741,6 +741,156 @@ inline int pg_lsh_v0_query_groups(const ceph::bufferlist& query_vector,
   return 0;
 }
 
+// Query-side probe ordering: which PGs a query visits and in what order.
+// It never touches pg_lsh_v0_select_write_pgs(), so an index already on
+// disk stays addressable.
+struct pg_lsh_v0_query_routing_t {
+  // Enumerate only the leading `table_count` hash tables. 0 keeps every
+  // table, which is the original behaviour.
+  //
+  // Data written with write_pg_count = d only ever lands in PGs derived
+  // from tables [0, d): pg_lsh_v0_exact_groups() emits its groups in table
+  // order and pg_lsh_v0_select_write_pgs() keeps the first d unique PGs, so
+  // with the common d=1 every vector in the index sits in a table-0 PG.
+  // pg_lsh_v0_group_to_pg() then mixes the table index into the hash, so a
+  // group from table t >= d resolves to a PG that holds nothing related to
+  // this query beyond a 1-in-pg_num coincidence. Probing those tables
+  // spends budget on PGs that cannot answer. Set this to the index's `d`.
+  uint32_t table_count = 0;
+  // Order perturbations by ascending probe score -- the sum over the bits
+  // a mask flips of |projection| onto that bit's hyperplane -- rather than
+  // by hamming distance and then bit index.
+  //
+  // A small |projection| means the query sat close to that hyperplane, so
+  // the bit was nearly a coin flip and the neighboring bucket is about as
+  // likely to hold the true neighbors. Bit-index order carries no such
+  // information; it ranks flipping bit 3 ahead of bit 7 for reasons
+  // unrelated to the query. This is the query-directed ordering multi-probe
+  // LSH uses, and it makes probe rank track expected usefulness, which an
+  // adaptive stopping rule needs.
+  bool margin_ordered_probes = false;
+};
+
+// Per-(table, mask) probe with the score used to order it.
+struct pg_lsh_v0_scored_group_t {
+  pg_lsh_v0_group_t group;
+  double score = 0;
+};
+
+// Per-bit projections for one table; the sign gives the bucket bit and the
+// magnitude the distance to that bit's hyperplane. Mirrors
+// pg_lsh_v0_lsh_bucket_id() so the two agree on the bucket.
+inline void pg_lsh_v0_bit_projections(const std::vector<float>& values,
+                                      uint32_t table,
+                                      uint32_t lsh_bucket_id_bits,
+                                      uint32_t seed,
+                                      std::vector<double> *projections)
+{
+  projections->assign(lsh_bucket_id_bits, 0.0);
+  for (uint32_t bit = 0; bit < lsh_bucket_id_bits; ++bit) {
+    double projection = 0;
+    for (uint32_t dim = 0; dim < values.size(); ++dim) {
+      projection += static_cast<double>(values[dim]) *
+        pg_lsh_v0_hyperplane_sign(seed, table, bit, dim);
+    }
+    (*projections)[bit] = projection;
+  }
+}
+
+inline double pg_lsh_v0_mask_score(uint32_t mask,
+                                   const std::vector<double>& projections)
+{
+  double score = 0;
+  for (uint32_t bit = 0; bit < projections.size(); ++bit) {
+    if ((mask & (uint32_t{1} << bit)) != 0) {
+      score += std::fabs(projections[bit]);
+    }
+  }
+  return score;
+}
+
+// pg_lsh_v0_query_groups() with the routing options above applied.
+// `routing` left at its defaults reproduces pg_lsh_v0_query_groups()
+// group-for-group, in the same order.
+inline int pg_lsh_v0_query_groups_routed(
+    const ceph::bufferlist& query_vector,
+    uint32_t dimension,
+    uint32_t lsh_bucket_id_bits,
+    uint32_t table_count,
+    uint32_t hamming_radius,
+    uint32_t seed,
+    const pg_lsh_v0_query_routing_t& routing,
+    std::vector<pg_lsh_v0_group_t> *groups)
+{
+  if (groups == nullptr || table_count == 0 || table_count > 0xffffU) {
+    return -EINVAL;
+  }
+  if (routing.table_count > table_count) {
+    return -EINVAL;
+  }
+  const uint32_t probed_tables =
+    routing.table_count == 0 ? table_count : routing.table_count;
+  if (!routing.margin_ordered_probes) {
+    return pg_lsh_v0_query_groups(
+        query_vector, dimension, lsh_bucket_id_bits, probed_tables,
+        hamming_radius, seed, groups);
+  }
+
+  std::vector<float> values;
+  int r = copy_float32_vector(query_vector, dimension, &values);
+  if (r < 0) {
+    return r;
+  }
+  if (lsh_bucket_id_bits == 0 ||
+      lsh_bucket_id_bits > ceph::rados::vector_lsh_v0_max_bits) {
+    lsh_bucket_id_bits = ceph::rados::vector_lsh_v0_bits;
+  }
+  if (hamming_radius > lsh_bucket_id_bits) {
+    hamming_radius = lsh_bucket_id_bits;
+  }
+
+  std::vector<pg_lsh_v0_scored_group_t> scored;
+  std::vector<double> projections;
+  for (uint32_t table = 0; table < probed_tables; ++table) {
+    pg_lsh_v0_bit_projections(
+        values, table, lsh_bucket_id_bits, seed, &projections);
+    const uint32_t exact_bucket =
+      pg_lsh_v0_lsh_bucket_id(values, table, lsh_bucket_id_bits, seed);
+    for (uint32_t distance = 0; distance <= hamming_radius; ++distance) {
+      for (const uint32_t mask :
+           pg_lsh_v0_hamming_masks_at_distance(lsh_bucket_id_bits, distance)) {
+        scored.push_back({
+          {table, exact_bucket ^ mask, distance},
+          pg_lsh_v0_mask_score(mask, projections),
+        });
+      }
+    }
+  }
+
+  // Ascending score, with ties broken by (distance, table) so the order is
+  // total: two masks can score identically, and an unstable order there
+  // would make the probe list depend on the sort implementation.
+  std::stable_sort(
+      scored.begin(), scored.end(),
+      [](const pg_lsh_v0_scored_group_t& a,
+         const pg_lsh_v0_scored_group_t& b) {
+        if (a.score != b.score) {
+          return a.score < b.score;
+        }
+        if (a.group.hamming_distance != b.group.hamming_distance) {
+          return a.group.hamming_distance < b.group.hamming_distance;
+        }
+        return a.group.table < b.group.table;
+      });
+
+  groups->clear();
+  groups->reserve(scored.size());
+  for (const auto& entry : scored) {
+    groups->push_back(entry.group);
+  }
+  return 0;
+}
+
 struct pg_lsh_v0_ranked_pg_t {
   uint32_t pg = 0;
   uint32_t min_hamming_distance = 0;
