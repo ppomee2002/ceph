@@ -27,6 +27,7 @@
 #include "include/encoding.h"
 #include "include/err.h"
 #include "include/scope_guard.h"
+#include "common/vector_pg_lsh_boundary.h"
 #include "common/vector_query_exec.h"
 #include "common/vector_omap_scan.h"
 #include "json_spirit/json_spirit.h"
@@ -1132,6 +1133,159 @@ TEST(VectorPlacement, PgLshSubOidPreservesDistanceBucketBoundary) {
                 above_sub_oid, config));
 }
 
+// The OSD's boundary-aware search (common/vector_pg_lsh_boundary.h) can
+// only prune correctly if its distance_bucket inversion agrees with
+// compute_sub_oid()'s own placement for the same vector. This treats each
+// candidate as its own query at tau=0 (an exact point, not a real search
+// radius) and checks the inverted range brackets the bucket
+// compute_sub_oid() actually placed it in.
+TEST(VectorPlacement, BoundaryBucketRangeAgreesWithComputeSubOidPlacement) {
+  std::vector<double> anchor = {1.0, 0.0};
+  const librados::vector_placement::pg_lsh_v0::sub_oid_config_t config = {
+    2, 12345, 4, 0, std::span<const double>(anchor),
+  };
+
+  const std::vector<std::vector<float>> candidates = {
+    {0.001f, 1.0f},
+    {-0.001f, 1.0f},
+    {1.0f, 0.0f},
+    {-1.0f, 0.0f},
+    {0.0f, 1.0f},
+    {3.0f, 4.0f},
+    {-3.0f, -4.0f},
+  };
+
+  for (const auto& values : candidates) {
+    bufferlist bl;
+    bl.append(reinterpret_cast<const char*>(values.data()),
+              values.size() * sizeof(float));
+    librados::vector_placement::pg_lsh_v0::sub_oid_t placed_sub_oid;
+    ASSERT_EQ(0, librados::vector_placement::pg_lsh_v0::compute_sub_oid(
+        bl, config, &placed_sub_oid));
+
+    auto state =
+      ceph::rados::vector_pg_lsh_boundary::compute_boundary_query_state(
+          values, anchor, config.seed, config.residual_bits);
+    ASSERT_TRUE(state.has_value());
+    const auto bound =
+      ceph::rados::vector_pg_lsh_boundary::distance_bound_from_tau(
+          state->Dq, 0.0);
+    const auto range =
+      ceph::rados::vector_pg_lsh_boundary::conservative_distance_bucket_range(
+          bound, config.distance_bucket_bits);
+    EXPECT_LE(range.lo, placed_sub_oid.distance_bucket);
+    EXPECT_GE(range.hi, placed_sub_oid.distance_bucket);
+  }
+}
+
+// server_side_boundary_search must reduce the within-PG sub_oid fan-out to
+// the exact sub_oid rather than the Hamming-ball expansion, since running
+// the client-side multi-probe and the OSD's expansion over the same PG
+// would scan overlapping key space. This exercises select_probe_sub_oids()
+// directly and needs no cluster, unlike PgLshV0SubOidProbeLimitIsPerPg
+// below, which covers the same gating through build_query_probes() and
+// query_sync().
+TEST(VectorPlacement, ServerSideBoundarySearchCollapsesToExactSubOid) {
+  float vector[] = {1.0, 2.0, 0.0, -1.0};
+  bufferlist vector_bl;
+  vector_bl.append(reinterpret_cast<const char *>(vector), sizeof(vector));
+
+  std::vector<double> random_anchor;
+  ASSERT_EQ(0, librados::vector_placement::pg_lsh_v0_random_anchor(
+      4, 12345, &random_anchor));
+
+  librados::vector_pg_lsh::index_config_t config;
+  config.dimension = 4;
+  config.data_type = ceph::rados::vector_data_type_float32;
+  config.distance_metric = ceph::rados::vector_distance_metric_euclidean;
+  config.k = 4;
+  config.l = 4;
+  config.seed = 12345;
+  config.d = 4;
+  config.distance_bucket_bits = 4;
+  config.residual_bits = 4;
+  config.anchor_mode = librados::vector_pg_lsh::anchor_mode_random;
+  config.anchor = random_anchor;
+
+  librados::vector_placement::pg_lsh_v0::sub_oid_t exact_sub_oid;
+  ASSERT_EQ(0, librados::vector_pg_lsh::compute_sub_oid(
+      vector_bl, config, &exact_sub_oid));
+  const std::string exact_sub_oid_name =
+    librados::vector_placement::pg_lsh_v0::format_sub_oid(
+        exact_sub_oid, librados::vector_pg_lsh::sub_oid_config_view(config));
+
+  // Baseline: without server_side_boundary_search a nonzero radius still
+  // expands into the Hamming-ball probe set.
+  {
+    librados::vector_pg_lsh::query_params_t query_params;
+    query_params.distance_bucket_radius = 1;
+    query_params.residual_hamming_radius = 1;
+    std::vector<std::string> probe_sub_oids;
+    ASSERT_EQ(0, librados::vector_pg_lsh::select_probe_sub_oids(
+        vector_bl, config, query_params, &probe_sub_oids));
+    EXPECT_GT(probe_sub_oids.size(), 1u);
+  }
+
+  // With server_side_boundary_search: one probe, the exact sub_oid,
+  // whatever the radius fields say. validate_query_params() requires them
+  // to be zero in this mode, checked separately below.
+  {
+    librados::vector_pg_lsh::query_params_t query_params;
+    query_params.server_side_boundary_search = true;
+    std::vector<std::string> probe_sub_oids;
+    ASSERT_EQ(0, librados::vector_pg_lsh::select_probe_sub_oids(
+        vector_bl, config, query_params, &probe_sub_oids));
+    ASSERT_EQ(1u, probe_sub_oids.size());
+    EXPECT_EQ(exact_sub_oid_name, probe_sub_oids[0]);
+  }
+
+  // The fixed client-side expansion and the adaptive server-side
+  // expansion must not both be requested for the same PG.
+  {
+    librados::vector_pg_lsh::pool_pg_info_t pool_info = {16, 16, 1};
+    librados::vector_pg_lsh::query_params_t query_params;
+    query_params.m = 1;
+    query_params.server_side_boundary_search = true;
+    query_params.distance_bucket_radius = 1;
+    std::string mismatch_field;
+    EXPECT_EQ(-EINVAL, librados::vector_pg_lsh::validate_query_params(
+        config, query_params, pool_info, &mismatch_field));
+    EXPECT_EQ("distance_bucket_radius", mismatch_field);
+  }
+  {
+    librados::vector_pg_lsh::pool_pg_info_t pool_info = {16, 16, 1};
+    librados::vector_pg_lsh::query_params_t query_params;
+    query_params.m = 1;
+    query_params.server_side_boundary_search = true;
+    query_params.residual_hamming_radius = 1;
+    std::string mismatch_field;
+    EXPECT_EQ(-EINVAL, librados::vector_pg_lsh::validate_query_params(
+        config, query_params, pool_info, &mismatch_field));
+    EXPECT_EQ("residual_hamming_radius", mismatch_field);
+  }
+
+  // apply_boundary_search_config() attaches boundary_search only when the
+  // caller asked for it, so a plain probe's payload does not grow.
+  {
+    ceph::rados::query_vectors_request_t req;
+    librados::vector_pg_lsh::query_params_t off_params;
+    librados::vector_pg_lsh::apply_boundary_search_config(
+        config, off_params, &req);
+    EXPECT_FALSE(req.boundary_search.has_value());
+
+    librados::vector_pg_lsh::query_params_t on_params;
+    on_params.server_side_boundary_search = true;
+    librados::vector_pg_lsh::apply_boundary_search_config(
+        config, on_params, &req);
+    ASSERT_TRUE(req.boundary_search.has_value());
+    EXPECT_EQ(config.anchor, req.boundary_search->anchor);
+    EXPECT_EQ(config.seed, req.boundary_search->seed);
+    EXPECT_EQ(config.distance_bucket_bits,
+              req.boundary_search->distance_bucket_bits);
+    EXPECT_EQ(config.residual_bits, req.boundary_search->residual_bits);
+  }
+}
+
 TEST(VectorPlacement, PgLshIndexConfigRoundTripsAllPlacementState) {
   librados::vector_pg_lsh::pool_pg_info_t pool_info = {
     16, 16, 1,
@@ -1714,6 +1868,94 @@ TEST_F(LibRadosIoPP, PgLshV0SubOidProbeLimitIsPerPg) {
   for (const auto& entry : probes_per_pg) {
     EXPECT_EQ(3u, entry.second);
   }
+}
+
+// End-to-end check of server_side_boundary_search: build_query_probes()
+// emits one probe per selected PG, the exact sub_oid rather than the
+// Hamming-ball expansion PgLshV0SubOidProbeLimitIsPerPg above covers, and
+// that probe's query_sync() round trip still returns the stored vector
+// through the OSD-side boundary path. That path finds no extra candidates
+// here, so the result matches the non-boundary case.
+TEST_F(LibRadosIoPP, PgLshV0ServerSideBoundarySearchSendsOneProbePerPg) {
+  librados::vector_pg_lsh::pool_pg_info_t pool_info;
+  ASSERT_EQ(0, pool_pg_info_for_test(cluster, pool_name, &pool_info));
+
+  const std::string bucket_name = "pg-lsh-boundary-bucket";
+  const std::string index_name = "pg-lsh-boundary-index";
+  auto locator_state =
+    std::make_shared<librados::vector_pg_lsh::locator_state_t>();
+  librados::vector_pg_lsh::locator_cache_t locator_cache(
+      &ioctx, pool_info, pool_name, bucket_name, index_name, locator_state);
+  ASSERT_EQ(0, locator_cache.precompute_all());
+
+  auto config = make_pg_lsh_test_index_config(
+      4, pool_info, 4, 4, 24680, 1, 4, 4);
+  std::string mismatch_field;
+  ASSERT_EQ(0, librados::vector_pg_lsh::create_index(
+      ioctx, bucket_name, index_name, config, pool_info, &mismatch_field));
+
+  const std::array<float, 4> vector = {1.0f, -2.0f, 3.0f, -4.0f};
+  bufferlist vector_bl;
+  vector_bl.append(reinterpret_cast<const char *>(vector.data()),
+                   vector.size() * sizeof(float));
+
+  std::vector<librados::vector_pg_lsh::put_target_t> put_targets;
+  ASSERT_EQ(0, librados::vector_pg_lsh::build_put_targets(
+      bucket_name, index_name, vector_bl, config, pool_info, &locator_cache,
+      &put_targets));
+  ceph::rados::put_vector_request_t put_req;
+  put_req.bucket_name = bucket_name;
+  put_req.index_name = index_name;
+  put_req.key = "boundary-search-vector-0";
+  put_req.data_type = config.data_type;
+  put_req.distance_metric = config.distance_metric;
+  put_req.dimension = config.dimension;
+  put_req.vector_data = vector_bl;
+  ASSERT_EQ(0, librados::vector_pg_lsh::put_vector(
+      ioctx, put_targets.front(), put_req));
+
+  librados::vector_pg_lsh::query_params_t query_params;
+  query_params.m = 1;
+  query_params.server_side_boundary_search = true;
+  std::vector<librados::vector_pg_lsh::query_probe_t> probes;
+  uint64_t generated_group_count = 0;
+  ASSERT_EQ(0, librados::vector_pg_lsh::build_query_probes(
+      bucket_name, index_name, vector_bl, config, query_params, pool_info,
+      &locator_cache, &probes, &generated_group_count));
+  // Exactly one probe: the fixed client-side sub_oid fan-out is disabled
+  // in this mode (see select_probe_sub_oids()/build_query_probes()).
+  ASSERT_EQ(1u, probes.size());
+
+  librados::vector_placement::pg_lsh_v0::sub_oid_t exact_sub_oid;
+  ASSERT_EQ(0, librados::vector_pg_lsh::compute_sub_oid(
+      vector_bl, config, &exact_sub_oid));
+  EXPECT_EQ(librados::vector_placement::pg_lsh_v0::format_sub_oid(
+                exact_sub_oid, librados::vector_pg_lsh::sub_oid_config_view(config)),
+            probes.front().sub_oid_name);
+
+  ceph::rados::query_vectors_request_t query_req;
+  query_req.bucket_name = bucket_name;
+  query_req.index_name = index_name;
+  query_req.data_type = config.data_type;
+  query_req.distance_metric = config.distance_metric;
+  query_req.dimension = config.dimension;
+  query_req.local_top_k = 1;
+  query_req.query_vector = vector_bl;
+  librados::vector_pg_lsh::apply_boundary_search_config(
+      config, query_params, &query_req);
+  ASSERT_TRUE(query_req.boundary_search.has_value());
+
+  bufferlist reply;
+  int op_rval = 0;
+  ASSERT_EQ(0, librados::vector_pg_lsh::query_sync(
+      ioctx, probes.front(), query_req, &reply, &op_rval));
+  ASSERT_EQ(0, op_rval);
+  ceph::rados::query_vectors_result_t result;
+  auto reply_it = reply.cbegin();
+  decode(result, reply_it);
+  ASSERT_TRUE(reply_it.end());
+  ASSERT_EQ(1u, result.entries.size());
+  EXPECT_EQ(put_req.key, result.entries.front().key);
 }
 
 TEST_F(LibRadosIoPP, PgLshPersistedAnchorRoutesWithoutTrainingFile) {

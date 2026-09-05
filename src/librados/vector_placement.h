@@ -18,6 +18,7 @@
 #include "include/ceph_hash.h"
 #include "include/object.h"
 #include "include/rados/vector_ops.h"
+#include "common/vector_pg_lsh_placement.h"
 
 namespace librados {
 namespace vector_placement {
@@ -44,25 +45,12 @@ inline std::string hex_u32(uint32_t value)
 
 inline std::string hex_u32_width(uint32_t value, uint32_t width)
 {
-  char buf[9];
-  if (width == 0) {
-    width = 1;
-  }
-  if (width > 8) {
-    width = 8;
-  }
-  std::snprintf(buf, sizeof(buf), "%0*x", static_cast<int>(width), value);
-  return std::string(buf);
+  return ceph::rados::vector_pg_lsh_placement::hex_u32_width(value, width);
 }
 
 inline uint32_t mix_u32(uint32_t value)
 {
-  value ^= value >> 16;
-  value *= 0x7feb352dU;
-  value ^= value >> 15;
-  value *= 0x846ca68bU;
-  value ^= value >> 16;
-  return value;
+  return ceph::rados::vector_pg_lsh_placement::mix_u32(value);
 }
 
 inline std::string hash_string(const std::string& value)
@@ -203,10 +191,8 @@ inline int pg_lsh_v0_hyperplane_sign(uint32_t seed,
                                      uint32_t bit,
                                      uint32_t dimension)
 {
-  const uint32_t mixed_seed =
-    seed ^ table * 0x9e3779b9U ^ bit * 0x85ebca6bU ^
-    dimension * 0xc2b2ae35U;
-  return (mix_u32(mixed_seed) & 1U) == 0U ? -1 : 1;
+  return ceph::rados::vector_pg_lsh_placement::pg_lsh_v0_hyperplane_sign(
+      seed, table, bit, dimension);
 }
 
 inline uint32_t lsh_v0_signature(
@@ -306,15 +292,13 @@ struct probe_config_t {
   uint32_t residual_hamming_radius = 0;
 };
 
-struct sub_oid_t {
-  uint16_t distance_bucket = 0;
-  uint16_t residual_code = 0;
-};
+using sub_oid_t = ceph::rados::vector_pg_lsh_placement::sub_oid_t;
 
 inline bool sub_oid_enabled(uint32_t distance_bucket_bits,
                             uint32_t residual_bits)
 {
-  return distance_bucket_bits != 0 || residual_bits != 0;
+  return ceph::rados::vector_pg_lsh_placement::sub_oid_enabled(
+      distance_bucket_bits, residual_bits);
 }
 
 inline uint64_t sub_oid_space(uint32_t distance_bucket_bits,
@@ -330,12 +314,8 @@ inline uint64_t sub_oid_space(uint32_t distance_bucket_bits,
 inline std::string format_sub_oid(const sub_oid_t& sub_oid,
                                   const sub_oid_config_t& config)
 {
-  const uint32_t distance_width =
-    std::max<uint32_t>(1, (config.distance_bucket_bits + 3) / 4);
-  const uint32_t residual_width =
-    std::max<uint32_t>(1, (config.residual_bits + 3) / 4);
-  return "g" + hex_u32_width(sub_oid.distance_bucket, distance_width) +
-    "_r" + hex_u32_width(sub_oid.residual_code, residual_width);
+  return ceph::rados::vector_pg_lsh_placement::format_sub_oid(
+      sub_oid, config.distance_bucket_bits, config.residual_bits);
 }
 
 } // namespace pg_lsh_v0
