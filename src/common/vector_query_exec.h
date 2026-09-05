@@ -643,6 +643,18 @@ public:
     return 0;
   }
 
+  // Worst distance among the kept top-k, in raw non-squared L2, without
+  // finalizing the accumulator. nullopt until local_top_k results have
+  // been retained: before that there is no acceptance threshold and every
+  // candidate still has to be considered.
+  std::optional<float> current_tau() const
+  {
+    if (!heapified) {
+      return std::nullopt;
+    }
+    return entries.front().distance;
+  }
+
 private:
   static bool has_required_fields(const vector_entry_view_t& entry)
   {
@@ -760,6 +772,26 @@ inline vector_entry_view_t make_vector_entry_view(
   view.has_vector_reference = true;
   view.vector_data = &entry.vector_data;
   return view;
+}
+
+// Whether an expansion round narrowed the acceptance bound, for the
+// best-first search's no-improvement termination check. current_tau() is
+// nullopt until local_top_k results have been retained, meaning no bound
+// exists yet rather than the worst possible one, so its absence must not
+// count as no improvement:
+//   tau_after == nullopt: top-k not filled yet, continue.
+//   tau_before == nullopt and tau_after set: first bound, continue.
+//   both set: continue only if tau_after < tau_before.
+inline bool tree_boundary_tau_improved(
+    std::optional<float> tau_before, std::optional<float> tau_after)
+{
+  if (!tau_after) {
+    return true;
+  }
+  if (!tau_before) {
+    return true;
+  }
+  return *tau_after < *tau_before;
 }
 
 } // namespace vector_query_exec
