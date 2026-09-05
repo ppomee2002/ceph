@@ -152,6 +152,9 @@ struct query_params_t {
   // raw-Euclidean layout, the only one where distance_bucket and tau
   // share a metric space. False keeps best-first ordering alone.
   bool tree_boundary_search_prune = false;
+  // Consecutive non-improving subtree expansions tolerated before the OSD
+  // stops expanding a probe. 0 stops at the first one.
+  uint32_t tree_boundary_search_no_improve_patience = 0;
   // Query-side PG selection and ordering. Changes which PGs a query
   // visits, never where a vector is stored, so it can be changed on an
   // index that is already populated.
@@ -1007,6 +1010,8 @@ inline void apply_tree_boundary_search_config(
       : ceph::rados::vector_pg_lsh_placement::distance_geometry_normalized_angular_v0;
   tree_boundary.raw_distance_scale_max = config.raw_distance_scale_max;
   tree_boundary.enable_pruning = query_params.tree_boundary_search_prune;
+  tree_boundary.no_improve_patience =
+      query_params.tree_boundary_search_no_improve_patience;
   req->tree_boundary_search = std::move(tree_boundary);
 }
 

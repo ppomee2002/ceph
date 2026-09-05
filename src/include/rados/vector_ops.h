@@ -261,9 +261,30 @@ struct vector_tree_boundary_search_config_t {
   // frontier entry can no longer improve the running tau, whichever comes
   // first.
   uint32_t budget = 0;
+  // One of common/vector_pg_lsh_placement.h's distance_geometry_*
+  // constants. The default, distance_geometry_normalized_angular_v0, does
+  // not put distance_bucket and tau in one metric space, so it supports
+  // best-first ordering but not exclusion;
+  // distance_geometry_raw_euclidean_v1 does.
   uint32_t distance_geometry = 0;
+  // Must be > 0 for distance_geometry_raw_euclidean_v1 and 0 otherwise;
+  // see index_config_t::raw_distance_scale_max.
   double raw_distance_scale_max = 0;
+  // Enables tau-based subtree exclusion rather than reordering alone.
+  // Only takes effect under distance_geometry_raw_euclidean_v1; the client
+  // already refuses to set it otherwise, but the OSD re-checks
+  // distance_geometry rather than trusting the request.
   bool enable_pruning = false;
+  // Consecutive expansions that fail to improve the running tau before
+  // the OSD stops expanding this probe.
+  //
+  // 0 stops at the first one, which assumes the frontier is ordered well
+  // enough that one miss implies the rest are misses. That does not hold
+  // here: most of the ONodes a full-PG scan finds and the traversal misses
+  // are still sitting on the frontier, admitted but never popped, with the
+  // expansion budget far from exhausted. Raising this trades reads for
+  // recall.
+  uint32_t no_improve_patience = 0;
 
   void encode(ceph::bufferlist& bl) const {
     ENCODE_START(1, 1, bl);
@@ -276,6 +297,7 @@ struct vector_tree_boundary_search_config_t {
     encode(distance_geometry, bl);
     encode(raw_distance_scale_max, bl);
     encode(enable_pruning, bl);
+    encode(no_improve_patience, bl);
     ENCODE_FINISH(bl);
   }
 
@@ -290,6 +312,7 @@ struct vector_tree_boundary_search_config_t {
     decode(distance_geometry, p);
     decode(raw_distance_scale_max, p);
     decode(enable_pruning, p);
+    decode(no_improve_patience, p);
     DECODE_FINISH(p);
   }
 };
