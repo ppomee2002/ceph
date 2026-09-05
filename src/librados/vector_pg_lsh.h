@@ -152,6 +152,10 @@ struct query_params_t {
   // raw-Euclidean layout, the only one where distance_bucket and tau
   // share a metric space. False keeps best-first ordering alone.
   bool tree_boundary_search_prune = false;
+  // Query-side PG selection and ordering. Changes which PGs a query
+  // visits, never where a vector is stored, so it can be changed on an
+  // index that is already populated.
+  vector_placement::pg_lsh_v0_query_routing_t query_routing;
 };
 
 // Query callers normally provide no immutable overrides. These optionals are
@@ -345,6 +349,12 @@ inline int validate_query_params(const index_config_t& config,
   }
   if (query_params.residual_hamming_radius > config.residual_bits) {
     set_mismatch_field(invalid_field, "residual_hamming_radius");
+    return -EINVAL;
+  }
+  if (query_params.query_routing.table_count > config.l) {
+    // Restricting to more tables than the index has is a caller mistake,
+    // not a silently clamped no-op.
+    set_mismatch_field(invalid_field, "query_routing_table_count");
     return -EINVAL;
   }
   if (config.distance_bucket_bits == 0 &&
@@ -762,9 +772,10 @@ inline int select_query_pgs(
   }
 
   std::vector<vector_placement::pg_lsh_v0_group_t> groups;
-  ret = vector_placement::pg_lsh_v0_query_groups(
+  ret = vector_placement::pg_lsh_v0_query_groups_routed(
       query_vector, config.dimension, config.k, config.l,
-      query_params.hamming_radius, config.seed, &groups);
+      query_params.hamming_radius, config.seed,
+      query_params.query_routing, &groups);
   if (ret < 0) {
     return ret;
   }
