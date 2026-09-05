@@ -121,6 +121,12 @@ struct query_params_t {
   uint32_t distance_bucket_radius = 0;
   uint32_t residual_hamming_radius = 0;
   uint32_t probe_limit_per_pg = 0;
+  // Send one probe per selected PG (the query's exact sub_oid) and let
+  // the OSD expand neighboring ONodes, instead of expanding the
+  // Hamming ball on the client. Requires distance_bucket_radius and
+  // residual_hamming_radius to be 0, since running both would scan
+  // overlapping key space. PG selection is unaffected.
+  bool server_side_boundary_search = false;
 };
 
 // Query callers normally provide no immutable overrides. These optionals are
@@ -303,6 +309,23 @@ inline int validate_query_params(const index_config_t& config,
       query_params.probe_limit_per_pg != 0) {
     set_mismatch_field(invalid_field, "probe_limit_per_pg");
     return -EINVAL;
+  }
+  if (query_params.server_side_boundary_search) {
+    // Client-side Hamming-ball expansion and the OSD's own expansion
+    // must not both run against the same PG.
+    if (query_params.distance_bucket_radius != 0) {
+      set_mismatch_field(invalid_field, "distance_bucket_radius");
+      return -EINVAL;
+    }
+    if (query_params.residual_hamming_radius != 0) {
+      set_mismatch_field(invalid_field, "residual_hamming_radius");
+      return -EINVAL;
+    }
+    if (!vector_placement::pg_lsh_v0::sub_oid_enabled(
+          config.distance_bucket_bits, config.residual_bits)) {
+      set_mismatch_field(invalid_field, "server_side_boundary_search");
+      return -EINVAL;
+    }
   }
   return 0;
 }
@@ -735,6 +758,48 @@ inline int build_put_targets(const std::string& bucket_name,
   return 0;
 }
 
+// sub_oid selection for build_query_probes(). Split out because it depends
+// only on (query_vector, config, query_params) and not on PG routing, so it
+// can be tested without an ioctx. Under server_side_boundary_search it
+// returns the exact sub_oid alone; validate_query_params() has already
+// rejected a nonzero radius in that mode.
+inline int select_probe_sub_oids(const ceph::bufferlist& query_vector,
+                                 const index_config_t& config,
+                                 const query_params_t& query_params,
+                                 std::vector<std::string> *probe_sub_oids)
+{
+  if (probe_sub_oids == nullptr) {
+    return -EINVAL;
+  }
+  probe_sub_oids->clear();
+
+  if (!vector_placement::pg_lsh_v0::sub_oid_enabled(
+        config.distance_bucket_bits, config.residual_bits)) {
+    probe_sub_oids->emplace_back();
+    return 0;
+  }
+
+  vector_placement::pg_lsh_v0::sub_oid_t exact_sub_oid;
+  int ret = compute_sub_oid(query_vector, config, &exact_sub_oid);
+  if (ret < 0) {
+    return ret;
+  }
+
+  if (query_params.server_side_boundary_search) {
+    probe_sub_oids->push_back(vector_placement::pg_lsh_v0::format_sub_oid(
+        exact_sub_oid, sub_oid_config_view(config)));
+    return 0;
+  }
+
+  const vector_placement::pg_lsh_v0::probe_config_t probe_config = {
+    query_params.distance_bucket_radius,
+    query_params.residual_hamming_radius,
+  };
+  return vector_placement::pg_lsh_v0::build_probe_sub_oids(
+      exact_sub_oid, sub_oid_config_view(config), probe_config,
+      probe_sub_oids);
+}
+
 inline int build_query_probes(const std::string& bucket_name,
                               const std::string& index_name,
                               const ceph::bufferlist& query_vector,
@@ -768,25 +833,10 @@ inline int build_query_probes(const std::string& bucket_name,
   }
 
   std::vector<std::string> probe_sub_oids;
-  if (vector_placement::pg_lsh_v0::sub_oid_enabled(
-        config.distance_bucket_bits, config.residual_bits)) {
-    vector_placement::pg_lsh_v0::sub_oid_t exact_sub_oid;
-    ret = compute_sub_oid(query_vector, config, &exact_sub_oid);
-    if (ret < 0) {
-      return ret;
-    }
-    const vector_placement::pg_lsh_v0::probe_config_t probe_config = {
-      query_params.distance_bucket_radius,
-      query_params.residual_hamming_radius,
-    };
-    ret = vector_placement::pg_lsh_v0::build_probe_sub_oids(
-        exact_sub_oid, sub_oid_config_view(config), probe_config,
-        &probe_sub_oids);
-    if (ret < 0) {
-      return ret;
-    }
-  } else {
-    probe_sub_oids.emplace_back();
+  ret = select_probe_sub_oids(
+      query_vector, config, query_params, &probe_sub_oids);
+  if (ret < 0) {
+    return ret;
   }
 
   probes->reserve(ranked.size() * probe_sub_oids.size());
@@ -821,6 +871,29 @@ inline int build_query_probes(const std::string& bucket_name,
     }
   }
   return 0;
+}
+
+// Fills req.boundary_search so the OSD can recompute Dmin/Dmax and the
+// residual wildcard mask itself. Left unset unless the query asked for
+// server-side boundary search, so a plain probe carries no extra bytes.
+inline void apply_boundary_search_config(
+    const index_config_t& config,
+    const query_params_t& query_params,
+    ceph::rados::query_vectors_request_t *req)
+{
+  if (req == nullptr) {
+    return;
+  }
+  if (!query_params.server_side_boundary_search) {
+    req->boundary_search.reset();
+    return;
+  }
+  ceph::rados::vector_boundary_search_config_t boundary;
+  boundary.anchor = config.anchor;
+  boundary.seed = config.seed;
+  boundary.distance_bucket_bits = config.distance_bucket_bits;
+  boundary.residual_bits = config.residual_bits;
+  req->boundary_search = std::move(boundary);
 }
 
 inline int verify_probe_locator(v14_2_0::IoCtx& ioctx,

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <errno.h>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -203,6 +204,45 @@ struct put_vector_request_t {
   }
 };
 
+// pg-lsh-v0 parameters the OSD needs to work out which neighboring sub_oid
+// ONodes in the same PG could still hold a closer candidate; see
+// common/vector_pg_lsh_boundary.h for the math. Kept in its own struct so
+// a query that does not use boundary-aware search carries none of these
+// bytes. `dimension` comes from query_vectors_request_t and is not
+// duplicated here.
+struct vector_boundary_search_config_t {
+  // Placement anchor (index_config_t::anchor), dimension-sized. Used for
+  // Dq = ||q_hat-a_hat||^2 and the query's residual projections.
+  std::vector<double> anchor;
+  // Hyperplane seed, needed to reproduce the residual signs
+  // compute_sub_oid() used at placement time.
+  uint32_t seed = 0;
+  // sub_oid bit widths, needed to invert the distance_bucket quantization
+  // and to know how many residual bits to project.
+  uint32_t distance_bucket_bits = 0;
+  uint32_t residual_bits = 0;
+
+  void encode(ceph::bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    using ceph::encode;
+    encode(anchor, bl);
+    encode(seed, bl);
+    encode(distance_bucket_bits, bl);
+    encode(residual_bits, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(ceph::bufferlist::const_iterator& p) {
+    DECODE_START(1, p);
+    using ceph::decode;
+    decode(anchor, p);
+    decode(seed, p);
+    decode(distance_bucket_bits, p);
+    decode(residual_bits, p);
+    DECODE_FINISH(p);
+  }
+};
+
 struct query_vectors_request_t {
   // Logical vector bucket name.
   std::string bucket_name;
@@ -222,6 +262,9 @@ struct query_vectors_request_t {
   // Placement keys that this routed probe should scan; empty scans all keys in
   // the target object. Missing prefixes are normal empty-result probes.
   std::vector<std::string> probe_prefixes;
+  // Set only for pg-lsh-v0 boundary-aware search. Absent means one ONode
+  // and no server-side expansion.
+  std::optional<vector_boundary_search_config_t> boundary_search;
 
   void encode(ceph::bufferlist& bl) const {
     ENCODE_START(1, 1, bl);
@@ -234,6 +277,11 @@ struct query_vectors_request_t {
     encode(local_top_k, bl);
     encode(query_vector, bl);
     encode(probe_prefixes, bl);
+    const bool has_boundary_search = boundary_search.has_value();
+    encode(has_boundary_search, bl);
+    if (has_boundary_search) {
+      boundary_search->encode(bl);
+    }
     ENCODE_FINISH(bl);
   }
 
@@ -248,6 +296,14 @@ struct query_vectors_request_t {
     decode(local_top_k, p);
     decode(query_vector, p);
     decode(probe_prefixes, p);
+    boundary_search.reset();
+    bool has_boundary_search = false;
+    decode(has_boundary_search, p);
+    if (has_boundary_search) {
+      vector_boundary_search_config_t boundary;
+      boundary.decode(p);
+      boundary_search = std::move(boundary);
+    }
     DECODE_FINISH(p);
   }
 };
