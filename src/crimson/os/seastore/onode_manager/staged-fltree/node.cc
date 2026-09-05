@@ -1214,6 +1214,182 @@ eagain_ifuture<std::pair<Ref<Node>, Ref<Node>>> InternalNode::get_child_peers(
   });
 }
 
+eagain_ifuture<Ref<tree_cursor_t>>
+InternalNode::lookup_largest_unconditional(context_t c)
+{
+  impl->validate_non_empty();
+  if (impl->is_level_tail()) {
+    auto p_child_addr = impl->get_tail_value();
+    return get_or_track_child(c, search_position_t::end(), p_child_addr->value
+    ).si_then([c](auto child) -> eagain_ifuture<Ref<tree_cursor_t>> {
+      if (child->level() == 0) {
+        return child->lookup_largest(c);
+      }
+      return static_cast<InternalNode*>(child.get())
+          ->lookup_largest_unconditional(c);
+    });
+  }
+  search_position_t pos;
+  const laddr_packed_t* p_child_addr = nullptr;
+  impl->get_largest_slot(&pos, nullptr, &p_child_addr);
+  return get_or_track_child(c, pos, p_child_addr->value
+  ).si_then([c](auto child) -> eagain_ifuture<Ref<tree_cursor_t>> {
+    if (child->level() == 0) {
+      return child->lookup_largest(c);
+    }
+    return static_cast<InternalNode*>(child.get())
+        ->lookup_largest_unconditional(c);
+  });
+}
+
+eagain_ifuture<InternalNode::child_range_t>
+InternalNode::get_primary_child_range(
+    context_t c, const key_hobj_t& key, MatchHistory& history)
+{
+  key_view_t self_key_view;
+  auto result = impl->lower_bound(key, history, &self_key_view);
+  search_position_t pos = result.position;
+  std::optional<ghobject_t> upper_incl;
+  if (!pos.is_end()) {
+    upper_incl = self_key_view.to_ghobj();
+  } // else: tail child, no stored key, +infinity
+
+  std::optional<ghobject_t> lower_excl;
+  const laddr_packed_t* p_child_addr = result.p_value;
+  Ref<Node> this_ref = this;
+  if (pos.is_end()) {
+    // Tail child: its lower bound is the largest *stored* key in this
+    // node, if any (mirrors get_child_peers()'s pos.is_end() branch --
+    // get_prev_slot()/get_slot() require a non-end position, so the tail
+    // case must go through get_largest_slot() instead).
+    if (!impl->is_keys_empty()) {
+      key_view_t largest_key_view;
+      impl->get_largest_slot(nullptr, &largest_key_view, nullptr);
+      lower_excl = largest_key_view.to_ghobj();
+    }
+  } else if (pos != search_position_t::begin()) {
+    search_position_t prev_pos = pos;
+    const laddr_packed_t* unused_addr = nullptr;
+    impl->get_prev_slot(prev_pos, nullptr, &unused_addr);
+    key_view_t prev_key_view;
+    const laddr_packed_t* unused_addr2 = nullptr;
+    impl->get_slot(prev_pos, &prev_key_view, &unused_addr2);
+    lower_excl = prev_key_view.to_ghobj();
+  } // else: first slot, -infinity
+
+  return get_or_track_child(c, pos, p_child_addr->value
+  ).si_then([this_ref, pos, lower_excl, upper_incl](auto child) {
+    return child_range_t{child, pos, lower_excl, upper_incl};
+  });
+}
+
+eagain_ifuture<std::optional<InternalNode::child_range_t>>
+InternalNode::get_prev_child_range(context_t c, const search_position_t& pos)
+{
+  Ref<Node> this_ref = this;
+  if (pos.is_end()) {
+    // `pos` is this node's own tail; its prev is the largest *stored*
+    // slot, if any (get_prev_slot()/get_slot() require a non-end
+    // position, so this must go through get_largest_slot() instead --
+    // mirrors get_child_peers()'s pos.is_end() branch).
+    if (impl->is_keys_empty()) {
+      return eagain_iertr::make_ready_future<std::optional<child_range_t>>(
+          std::nullopt);
+    }
+    search_position_t prev_pos;
+    key_view_t prev_key_view;
+    const laddr_packed_t* prev_addr = nullptr;
+    impl->get_largest_slot(&prev_pos, &prev_key_view, &prev_addr);
+    std::optional<ghobject_t> upper_incl = prev_key_view.to_ghobj();
+    std::optional<ghobject_t> lower_excl;
+    if (prev_pos != search_position_t::begin()) {
+      search_position_t pprev_pos = prev_pos;
+      const laddr_packed_t* unused_addr = nullptr;
+      impl->get_prev_slot(pprev_pos, nullptr, &unused_addr);
+      key_view_t pprev_key_view;
+      const laddr_packed_t* unused_addr2 = nullptr;
+      impl->get_slot(pprev_pos, &pprev_key_view, &unused_addr2);
+      lower_excl = pprev_key_view.to_ghobj();
+    }
+    return get_or_track_child(c, prev_pos, prev_addr->value
+    ).si_then([this_ref, prev_pos, lower_excl, upper_incl](auto child) {
+      return std::make_optional(
+          child_range_t{child, prev_pos, lower_excl, upper_incl});
+    });
+  }
+  if (pos == search_position_t::begin()) {
+    return eagain_iertr::make_ready_future<std::optional<child_range_t>>(
+        std::nullopt);
+  }
+  search_position_t prev_pos = pos;
+  const laddr_packed_t* prev_addr = nullptr;
+  impl->get_prev_slot(prev_pos, nullptr, &prev_addr);
+  key_view_t prev_key_view;
+  const laddr_packed_t* self_addr = nullptr;
+  impl->get_slot(prev_pos, &prev_key_view, &self_addr);
+  std::optional<ghobject_t> upper_incl = prev_key_view.to_ghobj();
+
+  std::optional<ghobject_t> lower_excl;
+  if (prev_pos != search_position_t::begin()) {
+    search_position_t pprev_pos = prev_pos;
+    const laddr_packed_t* unused_addr = nullptr;
+    impl->get_prev_slot(pprev_pos, nullptr, &unused_addr);
+    key_view_t pprev_key_view;
+    const laddr_packed_t* unused_addr2 = nullptr;
+    impl->get_slot(pprev_pos, &pprev_key_view, &unused_addr2);
+    lower_excl = pprev_key_view.to_ghobj();
+  }
+
+  return get_or_track_child(c, prev_pos, self_addr->value
+  ).si_then([this_ref, prev_pos, lower_excl, upper_incl](auto child) {
+    return std::make_optional(child_range_t{child, prev_pos, lower_excl, upper_incl});
+  });
+}
+
+eagain_ifuture<std::optional<InternalNode::child_range_t>>
+InternalNode::get_next_child_range(context_t c, const search_position_t& pos)
+{
+  Ref<Node> this_ref = this;
+  if (pos.is_end()) {
+    // `pos` is already this node's own tail: there is no "next".
+    return eagain_iertr::make_ready_future<std::optional<child_range_t>>(
+        std::nullopt);
+  }
+  search_position_t next_pos = pos;
+  key_view_t next_key_view;
+  const laddr_packed_t* next_addr = nullptr;
+  impl->get_next_slot(next_pos, &next_key_view, &next_addr);
+
+  // lower_excl for the next child is this node's own key at `pos` (`pos`
+  // is confirmed non-end above, so get_slot() is safe here).
+  key_view_t self_key_view;
+  const laddr_packed_t* self_addr_unused = nullptr;
+  impl->get_slot(pos, &self_key_view, &self_addr_unused);
+  std::optional<ghobject_t> lower_excl = self_key_view.to_ghobj();
+
+  if (next_pos.is_end()) {
+    if (impl->is_level_tail()) {
+      // the next child is this node's tail: no stored key, +infinity, and
+      // its address must be read via get_tail_value() (get_next_slot()
+      // does not populate next_addr for the tail case).
+      auto p_tail_addr = impl->get_tail_value();
+      return get_or_track_child(c, next_pos, p_tail_addr->value
+      ).si_then([this_ref, next_pos, lower_excl](auto child) {
+        return std::make_optional(
+            child_range_t{child, next_pos, lower_excl, std::nullopt});
+      });
+    } else {
+      return eagain_iertr::make_ready_future<std::optional<child_range_t>>(
+          std::nullopt);
+    }
+  }
+  std::optional<ghobject_t> upper_incl = next_key_view.to_ghobj();
+  return get_or_track_child(c, next_pos, next_addr->value
+  ).si_then([this_ref, next_pos, lower_excl, upper_incl](auto child) {
+    return std::make_optional(child_range_t{child, next_pos, lower_excl, upper_incl});
+  });
+}
+
 eagain_ifuture<Ref<InternalNode>> InternalNode::allocate_root(
     context_t c, laddr_hint_t hint, level_t old_root_level,
     laddr_t old_root_addr, Super::URef&& super)
@@ -1816,6 +1992,51 @@ LeafNode::get_next_cursor(context_t c, const search_position_t& pos)
     return eagain_iertr::make_ready_future<Ref<tree_cursor_t>>(
         get_or_track_cursor(next_pos, index_key, p_value_header));
   }
+}
+
+eagain_ifuture<std::optional<LeafNode::entry_t>>
+LeafNode::get_primary_entry(
+    context_t c, const key_hobj_t& key, MatchHistory& history)
+{
+  return lower_bound_tracked(c, key, history
+  ).si_then([c](auto result) -> std::optional<entry_t> {
+    if (result.is_end()) {
+      return std::nullopt;
+    }
+    auto key_view = result.p_cursor->get_key_view(c.vb.get_header_magic());
+    return entry_t{result.p_cursor, key_view.to_ghobj()};
+  });
+}
+
+std::optional<LeafNode::entry_t>
+LeafNode::get_prev_entry_local(const search_position_t& pos)
+{
+  if (pos == search_position_t::begin()) {
+    return std::nullopt;
+  }
+  search_position_t prev_pos = pos;
+  const value_header_t* unused_value = nullptr;
+  impl->get_prev_slot(prev_pos, nullptr, &unused_value);
+  auto [key_view, p_value_header] = get_kv(prev_pos);
+  return entry_t{
+      get_or_track_cursor(prev_pos, key_view, p_value_header),
+      key_view.to_ghobj()};
+}
+
+std::optional<LeafNode::entry_t>
+LeafNode::get_next_entry_local(const search_position_t& pos)
+{
+  search_position_t next_pos = pos;
+  key_view_t next_key_view;
+  const value_header_t* p_value_header = nullptr;
+  impl->get_next_slot(next_pos, &next_key_view, &p_value_header);
+  if (next_pos.is_end()) {
+    // this leaf's own boundary -- do not cross to a sibling leaf.
+    return std::nullopt;
+  }
+  return entry_t{
+      get_or_track_cursor(next_pos, next_key_view, p_value_header),
+      next_key_view.to_ghobj()};
 }
 
 template <bool FORCE_MERGE>

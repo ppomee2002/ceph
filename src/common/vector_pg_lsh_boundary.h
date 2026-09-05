@@ -338,6 +338,108 @@ inline std::optional<sub_oid_key_range_t> build_bucket_range_bound(
   };
 }
 
+// ---------------------------------------------------------------------
+// Support for best-first traversal over FLTree subtree ranges.
+//
+// The functions above support the flat sub_oid range scan. The ones below
+// decode a subtree's own key range -- InternalNode's child_range_t or
+// LeafNode's entry_t, a (lower_excl, upper_incl] pair of ghobject_t with
+// nullopt for -/+infinity -- into the same distance_bucket space, for a
+// caller descending node by node instead of issuing one flat range query.
+// No tree walking happens here.
+// ---------------------------------------------------------------------
+
+// Projects a child subtree's key range (lower_excl, upper_incl] down to a
+// [lo, hi] distance_bucket range, erring wide.
+//
+// Both edges are bucket-inclusive. format_sub_oid() orders distance_bucket
+// ahead of residual_code, so a boundary key's own bucket can still hold
+// admissible entries on the far side of that key, and narrowing past it
+// would prune them. Returns the full [0, max_bucket] range, i.e. do not
+// prune, if a boundary key does not parse as this family's sub_oid
+// suffix.
+inline bucket_range_t conservative_bucket_range_for_child(
+    const std::optional<ghobject_t>& lower_excl,
+    const std::optional<ghobject_t>& upper_incl,
+    uint32_t distance_bucket_bits,
+    uint32_t residual_bits)
+{
+  const uint32_t max_bucket = max_distance_bucket(distance_bucket_bits);
+  uint32_t lo = 0;
+  uint32_t hi = max_bucket;
+  if (lower_excl) {
+    auto parsed = split_anchor_sub_oid(
+        lower_excl->hobj, distance_bucket_bits, residual_bits);
+    if (parsed) {
+      lo = parsed->second.distance_bucket;
+    }
+  }
+  if (upper_incl) {
+    auto parsed = split_anchor_sub_oid(
+        upper_incl->hobj, distance_bucket_bits, residual_bits);
+    if (parsed) {
+      hi = parsed->second.distance_bucket;
+    }
+  } // else: tail child, +infinity -- leave hi = max_bucket
+  return {lo, hi};
+}
+
+// Inverse of conservative_distance_bucket_range(): widens a [lo, hi]
+// bucket range back out to the widest squared-L2 interval it could
+// represent, in the same units as boundary_query_state_t::Dq.
+inline distance_bound_t distance_interval_from_bucket_range(
+    const bucket_range_t& buckets, uint32_t distance_bucket_bits)
+{
+  if (distance_bucket_bits == 0) {
+    // No distance_bucket axis, so every candidate is admissible. Squared
+    // L2 between two unit vectors is always in [0, 4].
+    return {0.0, 4.0};
+  }
+  const uint32_t shift = 16 - distance_bucket_bits;
+  const uint32_t max_bucket = max_distance_bucket(distance_bucket_bits);
+  const uint32_t lo = std::min(buckets.lo, max_bucket);
+  const uint32_t hi = std::min(buckets.hi, max_bucket);
+  const double scaled_lo =
+    (static_cast<double>(lo) * (uint64_t{1} << shift)) / 65535.0;
+  const uint64_t hi_q = std::min<uint64_t>(
+      65535ULL,
+      (static_cast<uint64_t>(hi) + 1) * (uint64_t{1} << shift) - 1);
+  const double scaled_hi = static_cast<double>(hi_q) / 65535.0;
+  return {std::clamp(scaled_lo, 0.0, 1.0) * 4.0,
+          std::clamp(scaled_hi, 0.0, 1.0) * 4.0};
+}
+
+// Priority for the best-first frontier: the smallest squared-L2 gap
+// between Dq and any point this subtree's bucket range could represent.
+// Zero when Dq falls inside the interval, otherwise the distance to the
+// nearest edge. In the same units as Dq and distance_bound_t, not tau
+// (which is unsquared) or a bucket index.
+inline double min_possible_sq_distance(
+    double Dq, const bucket_range_t& buckets, uint32_t distance_bucket_bits)
+{
+  const auto interval =
+    distance_interval_from_bucket_range(buckets, distance_bucket_bits);
+  if (Dq < interval.min) {
+    return interval.min - Dq;
+  } else if (Dq > interval.max) {
+    return Dq - interval.max;
+  }
+  return 0.0;
+}
+
+// Whether a subtree's projected interval could still hold a candidate
+// within the current bound from distance_bound_from_tau(). Both sides are
+// squared-L2 intervals, so this is an interval-overlap test.
+inline bool bucket_range_overlaps_bound(
+    const bucket_range_t& buckets,
+    uint32_t distance_bucket_bits,
+    const distance_bound_t& bound)
+{
+  const auto interval =
+    distance_interval_from_bucket_range(buckets, distance_bucket_bits);
+  return interval.min <= bound.max && interval.max >= bound.min;
+}
+
 } // namespace ceph::rados::vector_pg_lsh_boundary
 
 #endif
