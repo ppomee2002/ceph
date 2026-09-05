@@ -5,6 +5,7 @@
 #include "include/rados/vector_ops.h"
 #include "common/vector_query_exec.h"
 #include "common/vector_omap_scan.h"
+#include "common/vector_pg_lsh_boundary.h"
 
 #include <charconv>
 #include <chrono>
@@ -1389,6 +1390,26 @@ maybe_get_omap_vals_by_keys(
   }
 }
 
+// Same call as above without the is_omap() gate maybe_get_omap_vals_by_keys()
+// applies through an object_info_t. Every FLAG_VECTOR_NODE object also has
+// FLAG_OMAP set (see PGBackend::put_vector()), so a boundary-aware
+// expansion candidate, for which only a ghobject_t is loaded, can call this
+// directly. The return type stays get_omap_iertr so callers can chain
+// .safe_then_interruptible/.handle_error_interruptible on it as they do on
+// maybe_get_omap_vals_by_keys().
+static
+get_omap_iertr::future<
+  crimson::os::FuturizedStore::Shard::omap_values_t>
+get_omap_vals_by_keys_for_oid(
+  crimson::os::BackendStore store,
+  const crimson::os::CollectionRef& coll,
+  const ghobject_t& oid,
+  const std::set<std::string>& keys_to_get)
+{
+  return crimson::os::with_store<&crimson::os::FuturizedStore::Shard::omap_get_values>(
+    store, coll, oid, keys_to_get, 0);
+}
+
 using get_omap_iterate_ertr =
   crimson::os::FuturizedStore::Shard::read_errorator::extend<
     crimson::ct_error::enodata>;
@@ -1687,6 +1708,241 @@ PGBackend::omap_get_vals_by_keys(
     );
 }
 
+// The free functions below cannot see PGBackend's protected
+// ll_read_errorator/ll_read_ierrorator aliases, so they re-derive the same
+// interruptible_errorator<IOInterruptCondition,
+// FuturizedStore::Shard::read_errorator> that query_vectors() uses under
+// its alias; the two compose.
+using vector_ll_read_errorator =
+  crimson::os::FuturizedStore::Shard::read_errorator;
+using vector_ll_read_ierrorator =
+  ::crimson::interruptible::interruptible_errorator<
+    ::crimson::osd::IOInterruptCondition,
+    vector_ll_read_errorator>;
+
+// Restores query_vectors_result_t::entries[*].key with one point OMAP
+// lookup per surviving entry_id on `oid`'s own OMAP, the same join
+// query_vectors() does for the anchor object; VectorNode LIST rows carry no
+// user_key (see vector_node_layout.h's vector_list_entry_le_t). Takes an
+// `oid` rather than an ObjectState so it also works for an expansion
+// candidate, whose identity lives on its own object. FLAG_VECTOR_NODE
+// objects always have FLAG_OMAP set, so this calls omap_get_values()
+// directly instead of going through maybe_get_omap_vals_by_keys(), which
+// needs an object_info_t this caller does not have.
+static
+vector_ll_read_ierrorator::future<>
+join_vector_result_user_keys(
+  crimson::os::BackendStore store,
+  const crimson::os::CollectionRef& coll,
+  const ghobject_t& oid,
+  ceph::rados::query_vectors_result_t& query_result)
+{
+  if (query_result.entries.empty()) {
+    co_return;
+  }
+  std::set<std::string> identity_keys_to_get;
+  for (const auto &entry : query_result.entries) {
+    identity_keys_to_get.insert("_ENTRY_" + entry.entry_id + ".user_key");
+  }
+  crimson::os::FuturizedStore::Shard::omap_values_t identity_vals;
+  co_await get_omap_vals_by_keys_for_oid(
+    store, coll, oid, identity_keys_to_get
+  ).safe_then_interruptible(
+    [&identity_vals](crimson::os::FuturizedStore::Shard::omap_values_t
+                        &&vals) {
+      identity_vals = std::move(vals);
+      return vector_ll_read_errorator::now();
+    }).handle_error_interruptible(
+    crimson::ct_error::enodata::handle([] {
+      return vector_ll_read_errorator::now();
+    }),
+    vector_ll_read_errorator::pass_further{}
+  );
+  for (auto &entry : query_result.entries) {
+    const auto found = identity_vals.find(
+      "_ENTRY_" + entry.entry_id + ".user_key");
+    if (found != identity_vals.end()) {
+      ceph::rados::vector_query_exec::decode_omap_string_value(
+        found->second, &entry.key);
+    }
+  }
+}
+
+// Boundary-aware expansion over one PG's pg-lsh-v0 sub_oid family, on top
+// of the anchor object's local top-k already in `query_result`. Walks
+// neighboring sub_oid ONodes whose distance_bucket range could still hold a
+// closer candidate, in tree order via list_objects(), and merges each into
+// the running top-k with the same merge_result_entry()/
+// sort_and_trim_results() used for every partial-result merge here.
+//
+// This is distance range traversal plus residual filtering, not
+// FLTree-internal pruning: residual_matches() is a post-filter on ONodes
+// list_objects() already returned, applied before their VectorNodes are
+// read.
+//
+// Two phases over the same admissible-range machinery:
+//  - Before local_top_k candidates exist there is no tau, so Dmin/Dmax
+//    does not apply. Rather than treat tau as infinite and scan the whole
+//    sub_oid space at once, a ring of distance_bucket values around the
+//    anchor's own bucket widens by one bucket per round
+//    (ring_bucket_range()) until local_top_k candidates are found or the
+//    ring covers every bucket.
+//  - Once local_top_k candidates exist, each round re-derives Dmin/Dmax
+//    and the residual wildcard mask from the current tau and lists only
+//    that range.
+//
+// The search ends on a round whose admissible range yields no new
+// unvisited, residual-matching ONode, whether or not the previous round
+// improved tau. The candidate-count ceiling is a separate stop.
+static
+vector_ll_read_ierrorator::future<>
+expand_query_vectors_boundary_aware(
+  crimson::os::BackendStore store,
+  const crimson::os::CollectionRef& coll,
+  shard_id_t shard,
+  const hobject_t& anchor,
+  const ceph::rados::query_vectors_request_t& req,
+  ceph::rados::query_vectors_result_t& query_result)
+{
+  namespace boundary = ceph::rados::vector_pg_lsh_boundary;
+
+  const auto& config = *req.boundary_search;
+  std::vector<float> query_values;
+  if (ceph::rados::vector_query_exec::copy_float32_values(
+        req.query_vector, req.dimension, &query_values) < 0) {
+    co_return;
+  }
+  auto state = boundary::compute_boundary_query_state(
+      query_values, config.anchor, config.seed, config.residual_bits);
+  if (!state) {
+    co_return;
+  }
+  auto split = boundary::split_anchor_sub_oid(
+      anchor, config.distance_bucket_bits, config.residual_bits);
+  if (!split) {
+    // Anchor object has no pg-lsh-v0 sub_oid suffix for these bit widths
+    // (e.g. distance_bucket_bits == residual_bits == 0): nothing to
+    // expand into.
+    co_return;
+  }
+  const std::string& prefix = split->first;
+  const uint32_t anchor_bucket = split->second.distance_bucket;
+
+  const uint64_t batch_size = local_conf().get_val<uint64_t>(
+      "seastore_vector_node_boundary_search_batch_size");
+  const uint64_t max_candidates = local_conf().get_val<uint64_t>(
+      "seastore_vector_node_boundary_search_max_candidates");
+
+  std::set<std::string> visited;
+  visited.insert(anchor.oid.name);
+  uint32_t ring = 0;
+  uint64_t scanned_candidates = 0;
+  bool bounded_termination = false;
+
+  while (scanned_candidates < max_candidates) {
+    boundary::bucket_range_t range;
+    boundary::residual_mask_t residual_mask;
+    const bool have_tau = query_result.entries.size() >= req.local_top_k;
+    if (have_tau) {
+      const double tau = query_result.entries.back().distance;
+      const auto bound = boundary::distance_bound_from_tau(state->Dq, tau);
+      range = boundary::conservative_distance_bucket_range(
+          bound, config.distance_bucket_bits);
+      residual_mask = boundary::compute_residual_wildcard_mask(*state, tau);
+    } else {
+      range = boundary::ring_bucket_range(
+          anchor_bucket, ring, config.distance_bucket_bits);
+      ++ring;
+    }
+
+    auto bound_range = boundary::build_bucket_range_bound(
+        anchor, shard, config.distance_bucket_bits, config.residual_bits,
+        range.lo, range.hi);
+    if (!bound_range) {
+      co_return;
+    }
+
+    std::vector<ghobject_t> new_candidates;
+    ghobject_t list_start = bound_range->start;
+    while (list_start < bound_range->end &&
+           scanned_candidates + new_candidates.size() < max_candidates) {
+      auto [batch, next] = co_await PGBackend::interruptor::make_interruptible(
+        crimson::os::with_store<
+          &crimson::os::FuturizedStore::Shard::list_objects>(
+          store, coll, list_start, bound_range->end, batch_size, 0));
+      for (auto& o : batch) {
+        const std::string& name = o.hobj.oid.name;
+        if (!o.is_no_gen() || visited.count(name)) {
+          continue;
+        }
+        if (name.size() < prefix.size() ||
+            name.compare(0, prefix.size(), prefix) != 0) {
+          visited.insert(name);
+          continue;
+        }
+        const std::string_view suffix(
+            name.data() + prefix.size(), name.size() - prefix.size());
+        auto parsed = ceph::rados::vector_pg_lsh_placement::parse_sub_oid(
+            suffix, config.distance_bucket_bits, config.residual_bits);
+        if (!parsed ||
+            !boundary::residual_matches(parsed->residual_code, residual_mask)) {
+          visited.insert(name);
+          continue;
+        }
+        new_candidates.push_back(o);
+      }
+      if (batch.empty() || !(next < bound_range->end)) {
+        break;
+      }
+      list_start = next;
+    }
+
+    if (new_candidates.empty()) {
+      if (have_tau) {
+        break;  // correctness termination
+      }
+      if (boundary::bucket_range_covers_all(
+            range, config.distance_bucket_bits)) {
+        break;  // exhausted the whole PG's sub_oid space pre-tau
+      }
+      continue;  // widen the ring and try again
+    }
+
+    for (const auto& candidate : new_candidates) {
+      visited.insert(candidate.hobj.oid.name);
+      ++scanned_candidates;
+      auto candidate_result = co_await crimson::os::with_store<
+        &crimson::os::FuturizedStore::Shard::query_vectors>(
+        store, coll, candidate, req, 0);
+      if (candidate_result && !candidate_result->entries.empty()) {
+        co_await join_vector_result_user_keys(
+            store, coll, candidate, *candidate_result);
+        for (const auto& entry : candidate_result->entries) {
+          ceph::rados::vector_query_exec::merge_result_entry(
+              &query_result.entries, entry);
+        }
+        ceph::rados::vector_query_exec::sort_and_trim_results(
+            &query_result.entries, req.local_top_k);
+        query_result.local_matching_entries +=
+          candidate_result->local_matching_entries;
+        query_result.local_distance_computations +=
+          candidate_result->local_distance_computations;
+      }
+      if (scanned_candidates >= max_candidates) {
+        bounded_termination = true;
+        break;
+      }
+    }
+  }
+  if (scanned_candidates >= max_candidates) {
+    bounded_termination = true;
+  }
+  logger().debug(
+    "query_vectors boundary-aware expansion: scanned_candidates={} "
+    "termination={}",
+    scanned_candidates, bounded_termination ? "bounded" : "correctness");
+}
+
 PGBackend::interruptible_future<>
 PGBackend::put_vector(
   ObjectState& os,
@@ -1817,6 +2073,16 @@ PGBackend::query_vectors(
             found->second, &entry.key);
         }
       }
+    }
+
+    // Boundary-aware search runs only for pg-lsh-v0 queries that set
+    // req.boundary_search, and only for the Euclidean metric: the
+    // Dmin/Dmax bound in common/vector_pg_lsh_boundary.h is an L2
+    // argument. Everything else takes the single-ONode path.
+    if (req.boundary_search &&
+        req.distance_metric == ceph::rados::vector_distance_metric_euclidean) {
+      co_await expand_query_vectors_boundary_aware(
+        store, coll, get_shard(), os.oi.soid, req, query_result);
     }
   } else {
     const bool measure =
