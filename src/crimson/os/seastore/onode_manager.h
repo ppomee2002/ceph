@@ -74,6 +74,7 @@ public:
     Transaction &t,
     tree_boundary_priority_fn_t priority,
     bool *has_more) = 0;
+
 };
 using TreeBoundaryQueryRef = std::unique_ptr<TreeBoundaryQuery>;
 

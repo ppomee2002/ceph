@@ -1,6 +1,9 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
 // vim: ts=8 sw=2 sts=2 expandtab
 
+#include <algorithm>
+#include <limits>
+
 #include "crimson/os/seastore/logging.h"
 
 #include "crimson/os/seastore/onode_manager/staged-fltree/fltree_onode_manager.h"
@@ -376,29 +379,66 @@ eagain_ifuture<Ref<Node>> FLTreeTreeBoundaryQuery::descend_primary(
       return FLTreeTreeBoundaryQuery::descend_primary(
           c, child_range.node, key, history, priority, frontier);
     }
-    auto *internal = static_cast<InternalNode*>(node.get());
-    return internal->get_prev_child_range(c, child_range.pos
-    ).si_then([c, internal, child_range, &key, &history, &priority, &frontier]
-        (auto prev) mutable -> eagain_ifuture<Ref<Node>> {
-      if (prev) {
-        auto p = priority(prev->lower_excl, prev->upper_incl);
-        if (p) {
-          frontier.push_back(
-              {prev->node, prev->lower_excl, prev->upper_incl});
-        }
-      }
-      return internal->get_next_child_range(c, child_range.pos
-      ).si_then([c, child_range, &key, &history, &priority, &frontier]
-          (auto next) mutable -> eagain_ifuture<Ref<Node>> {
-        if (next) {
-          auto p = priority(next->lower_excl, next->upper_incl);
-          if (p) {
-            frontier.push_back(
-                {next->node, next->lower_excl, next->upper_incl});
-          }
-        }
+    // Gated level: the anchor's own (shard, pool, crush) matched this
+    // node's separator, so this node's children are the ones that can
+    // hold the anchor PG's key run. Enumerate outward from the primary
+    return enqueue_slot_children(
+        c, node, key, child_range.pos, priority, frontier
+    ).si_then([c, child_range, &key, &history, &priority, &frontier]
+        () -> eagain_ifuture<Ref<Node>> {
         return FLTreeTreeBoundaryQuery::descend_primary(
             c, child_range.node, key, history, priority, frontier);
+    });
+  });
+}
+
+eagain_ifuture<> FLTreeTreeBoundaryQuery::enqueue_slot_children(
+    context_t c,
+    Ref<Node> node,
+    const key_hobj_t &key,
+    const search_position_t &primary_pos,
+    const crimson::os::seastore::tree_boundary_priority_fn_t &priority,
+    std::vector<frontier_entry_t> &frontier)
+{
+  auto *internal = static_cast<InternalNode*>(node.get());
+  std::vector<InternalNode::child_probe_t> probes;
+  bool ignored_truncated = false;
+  // Reads separator keys only -- no child extent is touched here, so a
+  // child the bound is about to refuse costs nothing.
+  internal->enumerate_left_slot(
+      key, primary_pos, kMaxSlotChildren, probes, &ignored_truncated);
+
+  std::vector<std::pair<double, InternalNode::child_probe_t>> admitted;
+  admitted.reserve(probes.size());
+  for (const auto &probe : probes) {
+    if (probe.pos == primary_pos) {
+      // The primary path descends into this one directly; queueing it too
+      // would double-visit the same subtree.
+      continue;
+    }
+    auto p = priority(probe.lower_excl, probe.upper_incl);
+    if (!p) {
+      continue;
+    }
+    admitted.emplace_back(*p, probe);
+  }
+  // Closest first. `priority` returns a lower bound on the distance the
+  // child's own key range could hold, so this is a distance ordering, not
+  // a key ordering.
+  std::stable_sort(admitted.begin(), admitted.end(),
+                   [](const auto &lhs, const auto &rhs) {
+                     return lhs.first < rhs.first;
+                   });
+  return seastar::do_with(
+      std::move(admitted), Ref<Node>(node),
+      [c, &frontier](auto &admitted, auto &node) {
+    return trans_intr::do_for_each(
+        admitted.begin(), admitted.end(),
+        [c, &frontier, &node](auto &entry) {
+      auto *internal = static_cast<InternalNode*>(node.get());
+      return internal->materialize_child(c, entry.second
+      ).si_then([&frontier](auto range) {
+        frontier.push_back({range.node, range.lower_excl, range.upper_incl});
       });
     });
   });
@@ -409,14 +449,62 @@ void FLTreeTreeBoundaryQuery::collect_leaf_local(
     const search_position_t &start_pos,
     const ghobject_t &start_key,
     const crimson::os::seastore::tree_boundary_priority_fn_t &priority,
-    std::vector<ghobject_t> &out_oids)
+    std::vector<ghobject_t> &out_oids,
+    bool *edge_prev,
+    bool *edge_next)
 {
-  out_oids.push_back(start_key);
+  *edge_prev = false;
+  *edge_next = false;
+  // The start entry is a candidate like any other and clears the same
+  // point test the walked neighbors do. It is not guaranteed admissible:
+  // expand_one() enters a leaf at lookup_smallest(), that page's first
+  // entry, and a leaf can hold keys from more than one PG, so that entry
+  // may belong to a neighboring PG. A containment gate that admits only
+  // fully contained ranges makes this unreachable, so it changes nothing
+  // today, but it is what allows admitting partially contained ranges.
+  search_position_t begin_pos = start_pos;
+  ghobject_t begin_key = start_key;
+  if (!priority(begin_key, begin_key)) {
+    // The entry this page was entered at is not admissible, but the page
+    // may still be: expand_one() enters at the page's first entry, and a
+    // page admitted for overlapping the anchor's key band often starts
+    // with the previous band's keys. Returning here would discard every
+    // admissible entry further in.
+    //
+    // Seek forward to the first entry the bound accepts instead. Bounded
+    // by this page's entry count on an extent already in memory, so no
+    // extra I/O; it moves where the walk starts, not what it emits.
+    bool found = false;
+    search_position_t pos = begin_pos;
+    while (true) {
+      auto next = leaf.get_next_entry_local(pos);
+      if (!next) {
+        *edge_next = true;
+        break;
+      }
+      if (priority(next->key, next->key)) {
+        begin_pos = next->cursor->get_position_ro();
+        begin_key = next->key;
+        found = true;
+        break;
+      }
+      pos = next->cursor->get_position_ro();
+    }
+    if (!found) {
+      return;
+    }
+  }
+  out_oids.push_back(begin_key);
   {
-    search_position_t pos = start_pos;
+    search_position_t pos = begin_pos;
     while (true) {
       auto prev = leaf.get_prev_entry_local(pos);
       if (!prev) {
+        // Ran off this page's first entry: get_prev_entry_local() never
+        // crosses into a sibling leaf. A structural stop rather than a
+        // bound rejection, so report it and let the caller offer the
+        // adjacent sibling leaf to `priority`.
+        *edge_prev = true;
         break;
       }
       // A single leaf entry is a point, not a range: use its own key as
@@ -431,10 +519,11 @@ void FLTreeTreeBoundaryQuery::collect_leaf_local(
     }
   }
   {
-    search_position_t pos = start_pos;
+    search_position_t pos = begin_pos;
     while (true) {
       auto next = leaf.get_next_entry_local(pos);
       if (!next) {
+        *edge_next = true;
         break;
       }
       auto p = priority(next->key, next->key);
@@ -445,6 +534,135 @@ void FLTreeTreeBoundaryQuery::collect_leaf_local(
       pos = next->cursor->get_position_ro();
     }
   }
+}
+
+void FLTreeTreeBoundaryQuery::order_oids_by_priority(
+    std::vector<ghobject_t> *oids,
+    const crimson::os::seastore::tree_boundary_priority_fn_t &priority)
+{
+  if (oids->size() < 2) {
+    return;
+  }
+  // A batch comes out in key order, which within one PG is
+  // (distance_bucket, residual_code): ascending distance from the PG's
+  // anchor, not from the query. Reorder it by the key the frontier already
+  // uses between subtrees, priority() on the entry's own exact key, so the
+  // caller opens the closest ONodes first.
+  //
+  // Nothing is added or dropped. Every entry passed the same predicate
+  // during collection, so a nullopt here means tau narrowed mid-batch;
+  // those are ordered last rather than discarded, keeping this a
+  // permutation.
+  std::vector<std::pair<double, ghobject_t>> keyed;
+  keyed.reserve(oids->size());
+  for (auto &oid : *oids) {
+    auto p = priority(oid, oid);
+    keyed.emplace_back(p.value_or(std::numeric_limits<double>::max()),
+                       std::move(oid));
+  }
+  std::stable_sort(keyed.begin(), keyed.end(),
+                   [](const auto &lhs, const auto &rhs) {
+                     return lhs.first < rhs.first;
+                   });
+  oids->clear();
+  for (auto &entry : keyed) {
+    oids->push_back(std::move(entry.second));
+  }
+}
+
+void FLTreeTreeBoundaryQuery::filter_new_oids(std::vector<ghobject_t> *oids)
+{
+  std::vector<ghobject_t> kept;
+  kept.reserve(oids->size());
+  for (auto &oid : *oids) {
+    if (collected_oids.insert(oid).second) {
+      kept.push_back(std::move(oid));
+    }
+  }
+  *oids = std::move(kept);
+}
+
+bool FLTreeTreeBoundaryQuery::push_frontier_deduped(
+    Ref<Node> node,
+    const std::optional<ghobject_t> &lower_excl,
+    const std::optional<ghobject_t> &upper_incl)
+{
+  auto same = [&lower_excl, &upper_incl](
+      const std::optional<ghobject_t> &l,
+      const std::optional<ghobject_t> &u) {
+    return l == lower_excl && u == upper_incl;
+  };
+  for (const auto &e : frontier) {
+    if (same(e.lower_excl, e.upper_incl)) {
+      return false;
+    }
+  }
+  for (const auto &e : expanded_ranges) {
+    if (same(e.lower_excl, e.upper_incl)) {
+      return false;
+    }
+  }
+  frontier.push_back({std::move(node), lower_excl, upper_incl});
+  return true;
+}
+
+void FLTreeTreeBoundaryQuery::consider_sibling(
+    std::optional<InternalNode::child_range_t> range,
+    const crimson::os::seastore::tree_boundary_priority_fn_t &priority)
+{
+  if (!range) {
+    // The leaf is its parent's first or tail child, so the adjacent leaf
+    // lives under the grandparent, out of reach of this one-level lookup.
+    // Counted as sibling_leaf_absent rather than worked around.
+    return;
+  }
+  auto p = priority(range->lower_excl, range->upper_incl);
+  if (!p) {
+    // A bound decision -- different PG, or outside the current tau
+    // distance/residual space -- so stopping here is correct.
+    return;
+  }
+  push_frontier_deduped(
+      range->node, range->lower_excl, range->upper_incl);
+}
+
+eagain_ifuture<> FLTreeTreeBoundaryQuery::enqueue_sibling_leaves(
+    context_t c,
+    Ref<Node> leaf_node,
+    bool want_prev,
+    bool want_next,
+    const crimson::os::seastore::tree_boundary_priority_fn_t &priority)
+{
+  if (!want_prev && !want_next) {
+    return eagain_iertr::now();
+  }
+  return seastar::do_with(
+      std::move(leaf_node),
+      [this, c, want_prev, want_next, &priority]
+      (auto &leaf_node) -> eagain_ifuture<> {
+    auto *leaf = static_cast<LeafNode*>(leaf_node.get());
+    auto next_step = [this, c, leaf, want_next, &priority]()
+        -> eagain_ifuture<> {
+      if (!want_next) {
+        return eagain_iertr::now();
+      }
+      return leaf->get_next_sibling_range(c
+      ).si_then([this, &priority](auto range) {
+        consider_sibling(std::move(range), priority);
+        return eagain_iertr::now();
+      });
+    };
+    if (!want_prev) {
+      return next_step();
+    }
+    return leaf->get_prev_sibling_range(c
+    ).si_then([this, &priority](auto range) {
+      consider_sibling(std::move(range), priority);
+      return eagain_iertr::now();
+    }).si_then([next_step] {
+      return next_step();
+    });
+  });
 }
 
 FLTreeTreeBoundaryQuery::ret FLTreeTreeBoundaryQuery::materialize(
@@ -493,14 +711,22 @@ FLTreeTreeBoundaryQuery::ret FLTreeTreeBoundaryQuery::primary(
     }).si_then([this, ctx, &key, &history, &priority, &oids](auto leaf_node) {
       auto *leaf = static_cast<LeafNode*>(leaf_node.get());
       return leaf->get_primary_entry(ctx, key, history
-      ).si_then([this, leaf_node, leaf, &priority, &oids](auto entry) {
-        if (entry) {
-          collect_leaf_local(*leaf, entry->cursor->get_position_ro(),
-                              entry->key, priority, oids);
+      ).si_then([this, ctx, leaf_node, leaf, &priority, &oids](auto entry)
+          -> eagain_ifuture<> {
+        if (!entry) {
+          return eagain_iertr::now();
         }
-        return seastar::now();
+        bool edge_prev = false;
+        bool edge_next = false;
+        collect_leaf_local(*leaf, entry->cursor->get_position_ro(),
+                            entry->key, priority, oids,
+                            &edge_prev, &edge_next);
+        return enqueue_sibling_leaves(ctx, leaf_node, edge_prev, edge_next,
+                                      priority);
       });
-    }).si_then([this, &t, &oids]() mutable {
+    }).si_then([this, &t, &oids, &priority]() mutable {
+      filter_new_oids(&oids);
+      order_oids_by_priority(&oids, priority);
       return materialize(t, std::move(oids));
     });
   });
@@ -520,12 +746,6 @@ eagain_ifuture<Ref<Node>> FLTreeTreeBoundaryQuery::descend_best(
   ).si_then([c, node, &priority, &frontier]
       (auto p_last) -> eagain_ifuture<Ref<Node>> {
     if (!p_last) {
-      // No stored children at all: only possible for a rare, transient
-      // level-tail internal node whose sole child is its own tail, which
-      // this generic, position-relative enumeration (get_prev_child_range/
-      // get_next_child_range, both requiring a reference slot to walk
-      // from) cannot reach on its own. This never produces an incorrect
-      // result -- only a missed, very narrow exploration opportunity.
       return eagain_iertr::make_ready_future<Ref<Node>>();
     }
     auto *internal = static_cast<InternalNode*>(node.get());
@@ -535,18 +755,13 @@ eagain_ifuture<Ref<Node>> FLTreeTreeBoundaryQuery::descend_best(
                p_last = std::move(*p_last)](auto tail) mutable
         -> eagain_ifuture<Ref<Node>> {
       return seastar::do_with(
-          std::optional<InternalNode::child_range_t>(),  // best
-          std::optional<double>(),                       // best_priority
-          std::vector<InternalNode::child_range_t>(),    // others (push to
-                                                          // frontier later)
-          std::move(p_last),                             // cur
+          std::optional<InternalNode::child_range_t>(),
+          std::optional<double>(),
+          std::vector<InternalNode::child_range_t>(),
+          std::move(p_last),
           [c, node, &priority, &frontier, tail = std::move(tail)]
-          (auto &best, auto &best_priority, auto &others,
-           auto &cur) mutable -> eagain_ifuture<Ref<Node>> {
-        // Evaluates one child against `priority`; tracks the lowest-
-        // priority admissible child in `best`, demoting any
-        // previous best (and every other admissible child) into
-        // `others` for the caller to push onto the global frontier.
+          (auto &best, auto &best_priority, auto &others, auto &cur) mutable
+              -> eagain_ifuture<Ref<Node>> {
         auto consider = [&best, &best_priority, &others, &priority]
             (InternalNode::child_range_t candidate) {
           auto p = priority(candidate.lower_excl, candidate.upper_incl);
@@ -586,8 +801,6 @@ eagain_ifuture<Ref<Node>> FLTreeTreeBoundaryQuery::descend_best(
             frontier.push_back({o.node, o.lower_excl, o.upper_incl});
           }
           if (!best) {
-            // Every child was rejected by the current bound: nothing
-            // left to explore in this subtree.
             return eagain_iertr::make_ready_future<Ref<Node>>();
           }
           return FLTreeTreeBoundaryQuery::descend_best(
@@ -597,77 +810,101 @@ eagain_ifuture<Ref<Node>> FLTreeTreeBoundaryQuery::descend_best(
     });
   });
 }
-
 FLTreeTreeBoundaryQuery::ret FLTreeTreeBoundaryQuery::expand_one(
     Transaction &t,
     crimson::os::seastore::tree_boundary_priority_fn_t priority,
     bool *has_more)
 {
-  // Re-evaluate every pending frontier entry against the CURRENT priority
-  // (tau may have narrowed since some of these were enqueued): drop any
-  // entry priority now rejects -- tau only narrows over the course of one
-  // query, so a rejected entry can never become admissible again -- and
-  // pick the lowest-priority survivor to descend into next.
-  std::vector<frontier_entry_t> survivors;
-  survivors.reserve(frontier.size());
-  std::optional<double> best_p;
-  size_t best_idx = 0;
-  bool have_best = false;
-  for (auto &entry : frontier) {
-    auto p = priority(entry.lower_excl, entry.upper_incl);
-    if (!p) {
-      continue;
-    }
-    if (!have_best || *p < *best_p) {
-      best_p = p;
-      best_idx = survivors.size();
-      have_best = true;
-    }
-    survivors.push_back(std::move(entry));
-  }
-  frontier = std::move(survivors);
-  if (!have_best) {
-    // Nothing left in the frontier still satisfies priority: it has
-    // already been dropped above (tau only narrows, so none of these can
-    // become relevant again this query) -- report no more work.
-    *has_more = false;
-    return seastar::do_with(
-        std::vector<ghobject_t>(),
-        [this, &t](auto &oids) { return materialize(t, std::move(oids)); });
-  }
-  auto picked_node = std::move(frontier[best_idx].node);
-  frontier.erase(frontier.begin() + best_idx);
-  *has_more = !frontier.empty();
-
+  // Pops frontier entries until one yields at least one oid this query has
+  // not already returned, or nothing admissible is left.
+  //
+  // Sibling-leaf continuation makes a leaf reachable by more than one
+  // route, so an expansion can produce only oids already collected. An
+  // empty candidate list would look to query_vectors_tree_boundary() like
+  // an exhausted frontier, and that caller stops the search on one. The
+  // loop terminates because each iteration removes an entry and
+  // push_frontier_deduped() never re-adds a range in expanded_ranges.
   return seastar::do_with(
       tree.get_node_context(t),
       std::move(priority),
       std::vector<ghobject_t>(),
-      std::move(picked_node),
-      [this, &t](auto &ctx, auto &priority, auto &oids, auto &picked_node) {
-    return descend_best(ctx, picked_node, priority, frontier
-    ).si_then([this, ctx, &priority, &oids]
-        (Ref<Node> leaf_node) -> eagain_ifuture<> {
-      if (!leaf_node) {
-        // The now-current (narrower) priority bound rejected every child
-        // at some level of this subtree: nothing to collect here.
-        return eagain_iertr::now();
+      [this, &t, has_more](auto &ctx, auto &priority, auto &oids) {
+    return trans_intr::repeat(
+        [this, &ctx, &priority, &oids, has_more]()
+            -> eagain_ifuture<seastar::stop_iteration> {
+      // Re-evaluate pending entries against the current priority, since
+      // tau may have narrowed since they were enqueued. Entries it now
+      // rejects are dropped: tau only narrows within one query, so they
+      // cannot become admissible again. Pick the lowest-priority
+      // survivor.
+      std::vector<frontier_entry_t> survivors;
+      survivors.reserve(frontier.size());
+      std::optional<double> best_p;
+      size_t best_idx = 0;
+      bool have_best = false;
+      for (auto &entry : frontier) {
+        auto p = priority(entry.lower_excl, entry.upper_incl);
+        if (!p) {
+          continue;
+        }
+        if (!have_best || *p < *best_p) {
+          best_p = p;
+          best_idx = survivors.size();
+          have_best = true;
+        }
+        survivors.push_back(std::move(entry));
       }
-      return seastar::do_with(std::move(leaf_node),
-          [this, ctx, &priority, &oids](auto &leaf_node) {
-        return leaf_node->lookup_smallest(ctx
-        ).si_then([this, ctx, &leaf_node, &priority, &oids](auto cursor) {
-          if (cursor->is_end()) {
-            return seastar::now();
+      frontier = std::move(survivors);
+      if (!have_best) {
+        *has_more = false;
+        return eagain_iertr::make_ready_future<seastar::stop_iteration>(
+            seastar::stop_iteration::yes);
+      }
+      auto picked_node = std::move(frontier[best_idx].node);
+      expanded_ranges.push_back({frontier[best_idx].lower_excl,
+                                 frontier[best_idx].upper_incl});
+      frontier.erase(frontier.begin() + best_idx);
+      *has_more = !frontier.empty();
+
+      return seastar::do_with(
+          std::move(picked_node),
+          [this, &ctx, &priority, &oids](auto &picked_node) {
+        return descend_best(ctx, picked_node, priority, frontier
+        ).si_then([this, &ctx, &priority, &oids]
+            (Ref<Node> leaf_node) -> eagain_ifuture<> {
+          if (!leaf_node) {
+            // The narrowed bound rejected every child at some level of
+            // this subtree, so there is nothing to collect.
+            return eagain_iertr::now();
           }
-          auto *leaf = static_cast<LeafNode*>(leaf_node.get());
-          auto key_view = cursor->get_key_view(ctx.vb.get_header_magic());
-          collect_leaf_local(*leaf, cursor->get_position_ro(),
-                             key_view.to_ghobj(), priority, oids);
-          return seastar::now();
+          return seastar::do_with(std::move(leaf_node),
+              [this, &ctx, &priority, &oids](auto &leaf_node) {
+            return leaf_node->lookup_smallest(ctx
+            ).si_then([this, &ctx, &leaf_node, &priority, &oids](auto cursor)
+                -> eagain_ifuture<> {
+              if (cursor->is_end()) {
+                return eagain_iertr::now();
+              }
+              auto *leaf = static_cast<LeafNode*>(leaf_node.get());
+              auto key_view = cursor->get_key_view(ctx.vb.get_header_magic());
+              bool edge_prev = false;
+              bool edge_next = false;
+              collect_leaf_local(*leaf, cursor->get_position_ro(),
+                                 key_view.to_ghobj(), priority, oids,
+                                 &edge_prev, &edge_next);
+              return enqueue_sibling_leaves(ctx, leaf_node, edge_prev,
+                                            edge_next, priority);
+            });
+          });
+        }).si_then([this, &oids, &priority] {
+          filter_new_oids(&oids);
+          order_oids_by_priority(&oids, priority);
+          return oids.empty()
+            ? seastar::stop_iteration::no
+            : seastar::stop_iteration::yes;
         });
       });
-    }).si_then([this, &t, &oids]() mutable {
+    }).si_then([this, &t, &oids] {
       return materialize(t, std::move(oids));
     });
   });
