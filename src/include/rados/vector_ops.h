@@ -285,6 +285,22 @@ struct vector_tree_boundary_search_config_t {
   // expansion budget far from exhausted. Raising this trades reads for
   // recall.
   uint32_t no_improve_patience = 0;
+  // Max ONodes this probe may open, i.e. read the VectorNode of and scan.
+  // 0 is unlimited and is the only setting that stays exact over the
+  // candidate space the bound admits.
+  //
+  // Setting it makes the search approximate: it stops early rather than
+  // showing nothing further can qualify. It exists because the exclusion
+  // available here, distance_bound_from_tau()'s triangle inequality around
+  // the PG anchor, excludes nothing on this workload -- LSH routing picks
+  // anchors close to the query, so ||q-anchor|| and tau are the same order
+  // of magnitude and the band [(radius-tau)^2, (radius+tau)^2] covers
+  // every populated distance_bucket.
+  //
+  // With distance-ordered traversal (closest child first, closest ONode
+  // first within a batch) this makes the recall/candidates trade explicit
+  // instead of leaving it to the frontier's stop rule.
+  uint32_t onode_budget = 0;
 
   void encode(ceph::bufferlist& bl) const {
     ENCODE_START(1, 1, bl);
@@ -298,6 +314,7 @@ struct vector_tree_boundary_search_config_t {
     encode(raw_distance_scale_max, bl);
     encode(enable_pruning, bl);
     encode(no_improve_patience, bl);
+    encode(onode_budget, bl);
     ENCODE_FINISH(bl);
   }
 
@@ -313,6 +330,7 @@ struct vector_tree_boundary_search_config_t {
     decode(raw_distance_scale_max, p);
     decode(enable_pruning, p);
     decode(no_improve_patience, p);
+    decode(onode_budget, p);
     DECODE_FINISH(p);
   }
 };
