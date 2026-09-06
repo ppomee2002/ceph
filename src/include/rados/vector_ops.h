@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <errno.h>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -203,6 +204,137 @@ struct put_vector_request_t {
   }
 };
 
+// pg-lsh-v0 parameters the OSD needs to work out which neighboring sub_oid
+// ONodes in the same PG could still hold a closer candidate; see
+// common/vector_pg_lsh_boundary.h for the math. Kept in its own struct so
+// a query that does not use boundary-aware search carries none of these
+// bytes. `dimension` comes from query_vectors_request_t and is not
+// duplicated here.
+struct vector_boundary_search_config_t {
+  // Placement anchor (index_config_t::anchor), dimension-sized. Used for
+  // Dq = ||q_hat-a_hat||^2 and the query's residual projections.
+  std::vector<double> anchor;
+  // Hyperplane seed, needed to reproduce the residual signs
+  // compute_sub_oid() used at placement time.
+  uint32_t seed = 0;
+  // sub_oid bit widths, needed to invert the distance_bucket quantization
+  // and to know how many residual bits to project.
+  uint32_t distance_bucket_bits = 0;
+  uint32_t residual_bits = 0;
+
+  void encode(ceph::bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    using ceph::encode;
+    encode(anchor, bl);
+    encode(seed, bl);
+    encode(distance_bucket_bits, bl);
+    encode(residual_bits, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(ceph::bufferlist::const_iterator& p) {
+    DECODE_START(1, p);
+    using ceph::decode;
+    decode(anchor, p);
+    decode(seed, p);
+    decode(distance_bucket_bits, p);
+    decode(residual_bits, p);
+    DECODE_FINISH(p);
+  }
+};
+
+// pg-lsh-v0 parameters for best-first traversal over FLTree subtree
+// ranges; see common/vector_pg_lsh_boundary.h and seastore.cc's
+// query_vectors(). Separate from vector_boundary_search_config_t above
+// because it is a different mechanism -- OSD-side tree descent with a
+// global frontier rather than a flat sub_oid range scan -- and the two are
+// never combined in one request.
+struct vector_tree_boundary_search_config_t {
+  // Same meaning as in vector_boundary_search_config_t: Dq, plus decoding
+  // a subtree's key range into a distance_bucket range.
+  std::vector<double> anchor;
+  uint32_t seed = 0;
+  uint32_t distance_bucket_bits = 0;
+  uint32_t residual_bits = 0;
+  // Max additional subtrees, beyond the primary path, the OSD may expand
+  // for this query. Traversal stops on this budget or when the next
+  // frontier entry can no longer improve the running tau, whichever comes
+  // first.
+  uint32_t budget = 0;
+  // One of common/vector_pg_lsh_placement.h's distance_geometry_*
+  // constants. The default, distance_geometry_normalized_angular_v0, does
+  // not put distance_bucket and tau in one metric space, so it supports
+  // best-first ordering but not exclusion;
+  // distance_geometry_raw_euclidean_v1 does.
+  uint32_t distance_geometry = 0;
+  // Must be > 0 for distance_geometry_raw_euclidean_v1 and 0 otherwise;
+  // see index_config_t::raw_distance_scale_max.
+  double raw_distance_scale_max = 0;
+  // Enables tau-based subtree exclusion rather than reordering alone.
+  // Only takes effect under distance_geometry_raw_euclidean_v1; the client
+  // already refuses to set it otherwise, but the OSD re-checks
+  // distance_geometry rather than trusting the request.
+  bool enable_pruning = false;
+  // Consecutive expansions that fail to improve the running tau before
+  // the OSD stops expanding this probe.
+  //
+  // 0 stops at the first one, which assumes the frontier is ordered well
+  // enough that one miss implies the rest are misses. That does not hold
+  // here: most of the ONodes a full-PG scan finds and the traversal misses
+  // are still sitting on the frontier, admitted but never popped, with the
+  // expansion budget far from exhausted. Raising this trades reads for
+  // recall.
+  uint32_t no_improve_patience = 0;
+  // Max ONodes this probe may open, i.e. read the VectorNode of and scan.
+  // 0 is unlimited and is the only setting that stays exact over the
+  // candidate space the bound admits.
+  //
+  // Setting it makes the search approximate: it stops early rather than
+  // showing nothing further can qualify. It exists because the exclusion
+  // available here, distance_bound_from_tau()'s triangle inequality around
+  // the PG anchor, excludes nothing on this workload -- LSH routing picks
+  // anchors close to the query, so ||q-anchor|| and tau are the same order
+  // of magnitude and the band [(radius-tau)^2, (radius+tau)^2] covers
+  // every populated distance_bucket.
+  //
+  // With distance-ordered traversal (closest child first, closest ONode
+  // first within a batch) this makes the recall/candidates trade explicit
+  // instead of leaving it to the frontier's stop rule.
+  uint32_t onode_budget = 0;
+
+  void encode(ceph::bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    using ceph::encode;
+    encode(anchor, bl);
+    encode(seed, bl);
+    encode(distance_bucket_bits, bl);
+    encode(residual_bits, bl);
+    encode(budget, bl);
+    encode(distance_geometry, bl);
+    encode(raw_distance_scale_max, bl);
+    encode(enable_pruning, bl);
+    encode(no_improve_patience, bl);
+    encode(onode_budget, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(ceph::bufferlist::const_iterator& p) {
+    DECODE_START(1, p);
+    using ceph::decode;
+    decode(anchor, p);
+    decode(seed, p);
+    decode(distance_bucket_bits, p);
+    decode(residual_bits, p);
+    decode(budget, p);
+    decode(distance_geometry, p);
+    decode(raw_distance_scale_max, p);
+    decode(enable_pruning, p);
+    decode(no_improve_patience, p);
+    decode(onode_budget, p);
+    DECODE_FINISH(p);
+  }
+};
+
 struct query_vectors_request_t {
   // Logical vector bucket name.
   std::string bucket_name;
@@ -222,6 +354,13 @@ struct query_vectors_request_t {
   // Placement keys that this routed probe should scan; empty scans all keys in
   // the target object. Missing prefixes are normal empty-result probes.
   std::vector<std::string> probe_prefixes;
+  // Set only for pg-lsh-v0 boundary-aware search. Absent means one ONode
+  // and no server-side expansion.
+  std::optional<vector_boundary_search_config_t> boundary_search;
+  // Set only for tree traversal (see
+  // vector_tree_boundary_search_config_t). A client never sets it together
+  // with boundary_search, but the two encode independently.
+  std::optional<vector_tree_boundary_search_config_t> tree_boundary_search;
 
   void encode(ceph::bufferlist& bl) const {
     ENCODE_START(1, 1, bl);
@@ -234,6 +373,16 @@ struct query_vectors_request_t {
     encode(local_top_k, bl);
     encode(query_vector, bl);
     encode(probe_prefixes, bl);
+    const bool has_boundary_search = boundary_search.has_value();
+    encode(has_boundary_search, bl);
+    if (has_boundary_search) {
+      boundary_search->encode(bl);
+    }
+    const bool has_tree_boundary_search = tree_boundary_search.has_value();
+    encode(has_tree_boundary_search, bl);
+    if (has_tree_boundary_search) {
+      tree_boundary_search->encode(bl);
+    }
     ENCODE_FINISH(bl);
   }
 
@@ -248,6 +397,22 @@ struct query_vectors_request_t {
     decode(local_top_k, p);
     decode(query_vector, p);
     decode(probe_prefixes, p);
+    boundary_search.reset();
+    bool has_boundary_search = false;
+    decode(has_boundary_search, p);
+    if (has_boundary_search) {
+      vector_boundary_search_config_t boundary;
+      boundary.decode(p);
+      boundary_search = std::move(boundary);
+    }
+    tree_boundary_search.reset();
+    bool has_tree_boundary_search = false;
+    decode(has_tree_boundary_search, p);
+    if (has_tree_boundary_search) {
+      vector_tree_boundary_search_config_t tree_boundary;
+      tree_boundary.decode(p);
+      tree_boundary_search = std::move(tree_boundary);
+    }
     DECODE_FINISH(p);
   }
 };

@@ -18,6 +18,7 @@
 #include "include/ceph_hash.h"
 #include "include/object.h"
 #include "include/rados/vector_ops.h"
+#include "common/vector_pg_lsh_placement.h"
 
 namespace librados {
 namespace vector_placement {
@@ -44,25 +45,12 @@ inline std::string hex_u32(uint32_t value)
 
 inline std::string hex_u32_width(uint32_t value, uint32_t width)
 {
-  char buf[9];
-  if (width == 0) {
-    width = 1;
-  }
-  if (width > 8) {
-    width = 8;
-  }
-  std::snprintf(buf, sizeof(buf), "%0*x", static_cast<int>(width), value);
-  return std::string(buf);
+  return ceph::rados::vector_pg_lsh_placement::hex_u32_width(value, width);
 }
 
 inline uint32_t mix_u32(uint32_t value)
 {
-  value ^= value >> 16;
-  value *= 0x7feb352dU;
-  value ^= value >> 15;
-  value *= 0x846ca68bU;
-  value ^= value >> 16;
-  return value;
+  return ceph::rados::vector_pg_lsh_placement::mix_u32(value);
 }
 
 inline std::string hash_string(const std::string& value)
@@ -203,10 +191,8 @@ inline int pg_lsh_v0_hyperplane_sign(uint32_t seed,
                                      uint32_t bit,
                                      uint32_t dimension)
 {
-  const uint32_t mixed_seed =
-    seed ^ table * 0x9e3779b9U ^ bit * 0x85ebca6bU ^
-    dimension * 0xc2b2ae35U;
-  return (mix_u32(mixed_seed) & 1U) == 0U ? -1 : 1;
+  return ceph::rados::vector_pg_lsh_placement::pg_lsh_v0_hyperplane_sign(
+      seed, table, bit, dimension);
 }
 
 inline uint32_t lsh_v0_signature(
@@ -299,6 +285,14 @@ struct sub_oid_config_t {
   uint32_t distance_bucket_bits = 0;
   uint32_t residual_bits = 0;
   std::span<const double> anchor;
+  // One of common/vector_pg_lsh_placement.h's distance_geometry_*
+  // constants. Defaults to the v0 normalized-angular geometry, so callers
+  // that leave it alone keep the same placement.
+  uint32_t distance_geometry =
+    ceph::rados::vector_pg_lsh_placement::distance_geometry_normalized_angular_v0;
+  // Must be > 0 for distance_geometry_raw_euclidean_v1 and 0 otherwise;
+  // see index_config_t::raw_distance_scale_max.
+  double raw_distance_scale_max = 0;
 };
 
 struct probe_config_t {
@@ -306,15 +300,13 @@ struct probe_config_t {
   uint32_t residual_hamming_radius = 0;
 };
 
-struct sub_oid_t {
-  uint16_t distance_bucket = 0;
-  uint16_t residual_code = 0;
-};
+using sub_oid_t = ceph::rados::vector_pg_lsh_placement::sub_oid_t;
 
 inline bool sub_oid_enabled(uint32_t distance_bucket_bits,
                             uint32_t residual_bits)
 {
-  return distance_bucket_bits != 0 || residual_bits != 0;
+  return ceph::rados::vector_pg_lsh_placement::sub_oid_enabled(
+      distance_bucket_bits, residual_bits);
 }
 
 inline uint64_t sub_oid_space(uint32_t distance_bucket_bits,
@@ -330,12 +322,8 @@ inline uint64_t sub_oid_space(uint32_t distance_bucket_bits,
 inline std::string format_sub_oid(const sub_oid_t& sub_oid,
                                   const sub_oid_config_t& config)
 {
-  const uint32_t distance_width =
-    std::max<uint32_t>(1, (config.distance_bucket_bits + 3) / 4);
-  const uint32_t residual_width =
-    std::max<uint32_t>(1, (config.residual_bits + 3) / 4);
-  return "g" + hex_u32_width(sub_oid.distance_bucket, distance_width) +
-    "_r" + hex_u32_width(sub_oid.residual_code, residual_width);
+  return ceph::rados::vector_pg_lsh_placement::format_sub_oid(
+      sub_oid, config.distance_bucket_bits, config.residual_bits);
 }
 
 } // namespace pg_lsh_v0
@@ -361,6 +349,75 @@ inline int pg_lsh_v0_random_anchor(uint32_t dimension,
 
 namespace pg_lsh_v0 {
 
+// raw_euclidean_v1 placement: distance_bucket encodes the raw squared
+// Euclidean distance ||v-anchor||^2, quantized against
+// config.raw_distance_scale_max rather than the fixed [0,4] range the
+// normalized angular distance uses. That puts Dv here, Dq in
+// vector_pg_lsh_boundary.h, and tau from current_tau() in the same units,
+// which is what server-side tau-based pruning needs. A raw distance past
+// raw_distance_scale_max clamps into the top bucket instead of erroring,
+// so that bucket's pruning interval is unbounded above; see
+// distance_interval_from_bucket_range_raw_euclidean().
+inline int compute_sub_oid_raw_euclidean(
+    const std::vector<float>& values,
+    const sub_oid_config_t& config,
+    sub_oid_t *out_sub_oid)
+{
+  if (!(config.raw_distance_scale_max > 0) ||
+      !std::isfinite(config.raw_distance_scale_max)) {
+    return -EINVAL;
+  }
+  double Dv = 0;
+  std::vector<double> offset(values.size(), 0.0);
+  for (uint32_t dim = 0; dim < config.dimension; ++dim) {
+    if (!std::isfinite(config.anchor[dim])) {
+      return -EINVAL;
+    }
+    offset[dim] = static_cast<double>(values[dim]) - config.anchor[dim];
+    Dv += offset[dim] * offset[dim];
+  }
+
+  const double scaled_distance =
+    std::clamp(Dv / config.raw_distance_scale_max, 0.0, 1.0);
+  const auto quantized_anchor_distance = static_cast<uint32_t>(
+      std::floor(scaled_distance * 65535.0 + 0.5));
+
+  uint32_t distance_bucket = 0;
+  if (config.distance_bucket_bits != 0) {
+    distance_bucket =
+      quantized_anchor_distance >> (16 - config.distance_bucket_bits);
+  }
+
+  uint32_t residual_code = 0;
+  if (config.residual_bits != 0) {
+    // Unlike the normalized_angular_v0 residual below, this projects the
+    // raw offset (v-anchor) directly: there is no unit anchor direction to
+    // orthogonalize an unnormalized offset against. The Cauchy-Schwarz
+    // argument in compute_residual_wildcard_mask() still holds in raw
+    // units, since w is unit-norm: proj(v)-proj(q) == w.(v-q) and
+    // |w.(v-q)| <= ||v-q||, which is the same distance tau measures.
+    const uint32_t residual_seed = config.seed ^ 0xbb67ae85U;
+    const double inv_sqrt_dim =
+      1.0 / std::sqrt(static_cast<double>(config.dimension));
+    for (uint32_t bit = 0; bit < config.residual_bits; ++bit) {
+      double projection = 0;
+      for (uint32_t dim = 0; dim < config.dimension; ++dim) {
+        projection += offset[dim] *
+          static_cast<double>(
+              pg_lsh_v0_hyperplane_sign(residual_seed, 0, bit, dim)) *
+          inv_sqrt_dim;
+      }
+      if (projection >= 0) {
+        residual_code |= (uint32_t{1} << bit);
+      }
+    }
+  }
+
+  out_sub_oid->distance_bucket = static_cast<uint16_t>(distance_bucket);
+  out_sub_oid->residual_code = static_cast<uint16_t>(residual_code);
+  return 0;
+}
+
 inline int compute_sub_oid(
     const ceph::bufferlist& vector_data,
     const sub_oid_config_t& config,
@@ -375,18 +432,34 @@ inline int compute_sub_oid(
       config.anchor.size() != config.dimension) {
     return -EINVAL;
   }
+  if (config.distance_geometry !=
+        ceph::rados::vector_pg_lsh_placement::
+          distance_geometry_normalized_angular_v0 &&
+      config.distance_geometry !=
+        ceph::rados::vector_pg_lsh_placement::
+          distance_geometry_raw_euclidean_v1) {
+    return -EINVAL;
+  }
 
   std::vector<float> values;
   int r = copy_float32_vector(vector_data, config.dimension, &values);
   if (r < 0) {
     return r;
   }
-
-  double norm_sq = 0;
   for (const float value : values) {
     if (!std::isfinite(value)) {
       return -EINVAL;
     }
+  }
+
+  if (config.distance_geometry ==
+      ceph::rados::vector_pg_lsh_placement::distance_geometry_raw_euclidean_v1) {
+    return compute_sub_oid_raw_euclidean(values, config, out_sub_oid);
+  }
+
+  // ---- normalized_angular_v0 ----
+  double norm_sq = 0;
+  for (const float value : values) {
     norm_sq += static_cast<double>(value) * value;
   }
 
@@ -664,6 +737,156 @@ inline int pg_lsh_v0_query_groups(const ceph::bufferlist& query_vector,
         });
       }
     }
+  }
+  return 0;
+}
+
+// Query-side probe ordering: which PGs a query visits and in what order.
+// It never touches pg_lsh_v0_select_write_pgs(), so an index already on
+// disk stays addressable.
+struct pg_lsh_v0_query_routing_t {
+  // Enumerate only the leading `table_count` hash tables. 0 keeps every
+  // table, which is the original behaviour.
+  //
+  // Data written with write_pg_count = d only ever lands in PGs derived
+  // from tables [0, d): pg_lsh_v0_exact_groups() emits its groups in table
+  // order and pg_lsh_v0_select_write_pgs() keeps the first d unique PGs, so
+  // with the common d=1 every vector in the index sits in a table-0 PG.
+  // pg_lsh_v0_group_to_pg() then mixes the table index into the hash, so a
+  // group from table t >= d resolves to a PG that holds nothing related to
+  // this query beyond a 1-in-pg_num coincidence. Probing those tables
+  // spends budget on PGs that cannot answer. Set this to the index's `d`.
+  uint32_t table_count = 0;
+  // Order perturbations by ascending probe score -- the sum over the bits
+  // a mask flips of |projection| onto that bit's hyperplane -- rather than
+  // by hamming distance and then bit index.
+  //
+  // A small |projection| means the query sat close to that hyperplane, so
+  // the bit was nearly a coin flip and the neighboring bucket is about as
+  // likely to hold the true neighbors. Bit-index order carries no such
+  // information; it ranks flipping bit 3 ahead of bit 7 for reasons
+  // unrelated to the query. This is the query-directed ordering multi-probe
+  // LSH uses, and it makes probe rank track expected usefulness, which an
+  // adaptive stopping rule needs.
+  bool margin_ordered_probes = false;
+};
+
+// Per-(table, mask) probe with the score used to order it.
+struct pg_lsh_v0_scored_group_t {
+  pg_lsh_v0_group_t group;
+  double score = 0;
+};
+
+// Per-bit projections for one table; the sign gives the bucket bit and the
+// magnitude the distance to that bit's hyperplane. Mirrors
+// pg_lsh_v0_lsh_bucket_id() so the two agree on the bucket.
+inline void pg_lsh_v0_bit_projections(const std::vector<float>& values,
+                                      uint32_t table,
+                                      uint32_t lsh_bucket_id_bits,
+                                      uint32_t seed,
+                                      std::vector<double> *projections)
+{
+  projections->assign(lsh_bucket_id_bits, 0.0);
+  for (uint32_t bit = 0; bit < lsh_bucket_id_bits; ++bit) {
+    double projection = 0;
+    for (uint32_t dim = 0; dim < values.size(); ++dim) {
+      projection += static_cast<double>(values[dim]) *
+        pg_lsh_v0_hyperplane_sign(seed, table, bit, dim);
+    }
+    (*projections)[bit] = projection;
+  }
+}
+
+inline double pg_lsh_v0_mask_score(uint32_t mask,
+                                   const std::vector<double>& projections)
+{
+  double score = 0;
+  for (uint32_t bit = 0; bit < projections.size(); ++bit) {
+    if ((mask & (uint32_t{1} << bit)) != 0) {
+      score += std::fabs(projections[bit]);
+    }
+  }
+  return score;
+}
+
+// pg_lsh_v0_query_groups() with the routing options above applied.
+// `routing` left at its defaults reproduces pg_lsh_v0_query_groups()
+// group-for-group, in the same order.
+inline int pg_lsh_v0_query_groups_routed(
+    const ceph::bufferlist& query_vector,
+    uint32_t dimension,
+    uint32_t lsh_bucket_id_bits,
+    uint32_t table_count,
+    uint32_t hamming_radius,
+    uint32_t seed,
+    const pg_lsh_v0_query_routing_t& routing,
+    std::vector<pg_lsh_v0_group_t> *groups)
+{
+  if (groups == nullptr || table_count == 0 || table_count > 0xffffU) {
+    return -EINVAL;
+  }
+  if (routing.table_count > table_count) {
+    return -EINVAL;
+  }
+  const uint32_t probed_tables =
+    routing.table_count == 0 ? table_count : routing.table_count;
+  if (!routing.margin_ordered_probes) {
+    return pg_lsh_v0_query_groups(
+        query_vector, dimension, lsh_bucket_id_bits, probed_tables,
+        hamming_radius, seed, groups);
+  }
+
+  std::vector<float> values;
+  int r = copy_float32_vector(query_vector, dimension, &values);
+  if (r < 0) {
+    return r;
+  }
+  if (lsh_bucket_id_bits == 0 ||
+      lsh_bucket_id_bits > ceph::rados::vector_lsh_v0_max_bits) {
+    lsh_bucket_id_bits = ceph::rados::vector_lsh_v0_bits;
+  }
+  if (hamming_radius > lsh_bucket_id_bits) {
+    hamming_radius = lsh_bucket_id_bits;
+  }
+
+  std::vector<pg_lsh_v0_scored_group_t> scored;
+  std::vector<double> projections;
+  for (uint32_t table = 0; table < probed_tables; ++table) {
+    pg_lsh_v0_bit_projections(
+        values, table, lsh_bucket_id_bits, seed, &projections);
+    const uint32_t exact_bucket =
+      pg_lsh_v0_lsh_bucket_id(values, table, lsh_bucket_id_bits, seed);
+    for (uint32_t distance = 0; distance <= hamming_radius; ++distance) {
+      for (const uint32_t mask :
+           pg_lsh_v0_hamming_masks_at_distance(lsh_bucket_id_bits, distance)) {
+        scored.push_back({
+          {table, exact_bucket ^ mask, distance},
+          pg_lsh_v0_mask_score(mask, projections),
+        });
+      }
+    }
+  }
+
+  // Ascending score, with ties broken by (distance, table) so the order is
+  // total: two masks can score identically, and an unstable order there
+  // would make the probe list depend on the sort implementation.
+  std::stable_sort(
+      scored.begin(), scored.end(),
+      [](const pg_lsh_v0_scored_group_t& a,
+         const pg_lsh_v0_scored_group_t& b) {
+        if (a.score != b.score) {
+          return a.score < b.score;
+        }
+        if (a.group.hamming_distance != b.group.hamming_distance) {
+          return a.group.hamming_distance < b.group.hamming_distance;
+        }
+        return a.group.table < b.group.table;
+      });
+
+  groups->clear();
+  groups->reserve(scored.size());
+  for (const auto& entry : scored) {
+    groups->push_back(entry.group);
   }
   return 0;
 }

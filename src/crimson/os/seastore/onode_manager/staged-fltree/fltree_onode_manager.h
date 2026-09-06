@@ -425,6 +425,120 @@ using OnodeTree = Btree<FLTreeOnode>;
 
 using crimson::common::get_conf;
 
+/**
+ * FLTreeTreeBoundaryQuery
+ *
+ * Sibling subtrees share one best-first frontier. `priority` is
+ * re-evaluated before expansion because the caller's tau may have narrowed.
+ */
+class FLTreeTreeBoundaryQuery final : public crimson::os::seastore::TreeBoundaryQuery {
+public:
+  explicit FLTreeTreeBoundaryQuery(OnodeTree &tree) : tree(tree) {}
+
+  ret primary(
+    Transaction &t,
+    const ghobject_t &anchor,
+    crimson::os::seastore::tree_boundary_priority_fn_t priority) final;
+
+  ret expand_one(
+    Transaction &t,
+    crimson::os::seastore::tree_boundary_priority_fn_t priority,
+    bool *has_more) final;
+
+private:
+  struct frontier_entry_t {
+    Ref<Node> node;
+    std::optional<ghobject_t> lower_excl;
+    std::optional<ghobject_t> upper_incl;
+  };
+  struct frontier_bound_t {
+    std::optional<ghobject_t> lower_excl;
+    std::optional<ghobject_t> upper_incl;
+  };
+
+  OnodeTree &tree;
+  std::vector<frontier_entry_t> frontier;
+  // Ranges already popped this query. With the live `frontier` this is the
+  // de-dup set for push_frontier_deduped(): an adjacent leaf can be reached
+  // both as a descend_*() sibling and as a page-edge neighbor, and
+  // expanding it twice re-opens every ONode in it.
+  std::vector<frontier_bound_t> expanded_ranges;
+  // Every oid already returned this query. The same leaf is reachable by
+  // more than one route at different bound granularities, and returning an
+  // oid twice re-reads its VectorNode and rescans vectors the accumulator
+  // already has.
+  std::set<ghobject_t> collected_oids;
+
+  static eagain_ifuture<Ref<Node>> descend_primary(
+    context_t c,
+    Ref<Node> node,
+    const key_hobj_t &key,
+    MatchHistory &history,
+    const crimson::os::seastore::tree_boundary_priority_fn_t &priority,
+    std::vector<frontier_entry_t> &frontier);
+
+  /// Descends through the best child and queues the other admissible ones.
+  /// Bounds separator enumeration for a malformed or pathological slot.
+  static constexpr unsigned kMaxSlotChildren = 32;
+
+  /// Queues admissible children in the anchor's STAGE_LEFT slot.
+  static eagain_ifuture<> enqueue_slot_children(
+    context_t c,
+    Ref<Node> node,
+    const key_hobj_t &key,
+    const search_position_t &primary_pos,
+    const crimson::os::seastore::tree_boundary_priority_fn_t &priority,
+    std::vector<frontier_entry_t> &frontier);
+
+  static eagain_ifuture<Ref<Node>> descend_best(
+    context_t c,
+    Ref<Node> node,
+    const crimson::os::seastore::tree_boundary_priority_fn_t &priority,
+    std::vector<frontier_entry_t> &frontier);
+
+  /// Reports page edges so the caller can offer adjacent leaves to priority.
+  static void collect_leaf_local(
+    LeafNode &leaf,
+    const search_position_t &start_pos,
+    const ghobject_t &start_key,
+    const crimson::os::seastore::tree_boundary_priority_fn_t &priority,
+    std::vector<ghobject_t> &out_oids,
+    bool *edge_prev,
+    bool *edge_next);
+
+  /// Offers adjacent leaf ranges to priority and queues accepted ones.
+  eagain_ifuture<> enqueue_sibling_leaves(
+    context_t c,
+    Ref<Node> leaf_node,
+    bool want_prev,
+    bool want_next,
+    const crimson::os::seastore::tree_boundary_priority_fn_t &priority);
+
+  /// Applies `priority` to one candidate sibling range and enqueues it.
+  void consider_sibling(
+    std::optional<InternalNode::child_range_t> range,
+    const crimson::os::seastore::tree_boundary_priority_fn_t &priority);
+
+  /// Drops oids this query already returned.
+  void filter_new_oids(std::vector<ghobject_t> *oids);
+
+  /// Sorts one batch of candidate oids by `priority` on each entry's exact
+  /// key, i.e. closest to the query first rather than key order, which
+  /// within a PG is distance-from-the-anchor order. Permutation only.
+  static void order_oids_by_priority(
+      std::vector<ghobject_t> *oids,
+      const crimson::os::seastore::tree_boundary_priority_fn_t &priority);
+
+  /// Frontier push with de-duplication against both what is still pending
+  /// and what has already been expanded. Returns true if pushed.
+  bool push_frontier_deduped(
+    Ref<Node> node,
+    const std::optional<ghobject_t> &lower_excl,
+    const std::optional<ghobject_t> &upper_incl);
+
+  ret materialize(Transaction &t, std::vector<ghobject_t> oids);
+};
+
 class FLTreeOnodeManager : public crimson::os::seastore::OnodeManager {
   OnodeTree tree;
 
@@ -465,6 +579,10 @@ public:
     const ghobject_t& start,
     const ghobject_t& end,
     uint64_t limit) final;
+
+  crimson::os::seastore::TreeBoundaryQueryRef create_tree_boundary_query() final {
+    return std::make_unique<FLTreeTreeBoundaryQuery>(tree);
+  }
 
   ~FLTreeOnodeManager();
 };

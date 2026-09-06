@@ -4,6 +4,7 @@
 #include "seastore.h"
 
 #include <algorithm>
+#include <unordered_set>
 
 #include <boost/algorithm/string/trim.hpp>
 #include <fmt/format.h>
@@ -16,6 +17,7 @@
 
 #include "common/JSONFormatter.h"
 #include "common/safe_io.h"
+#include "common/vector_pg_lsh_boundary.h"
 #include "common/vector_query_exec.h"
 #include "include/stringify.h"
 #include "os/Transaction.h"
@@ -1569,6 +1571,9 @@ SeaStore::Shard::query_vectors(
 {
   LOG_PREFIX(SeaStoreS::query_vectors);
   assert(store_active);
+  if (request.tree_boundary_search) {
+    return query_vectors_tree_boundary(ch, oid, request, op_flags);
+  }
   const bool measure =
     LOCAL_LOGGER.is_enabled(seastar::log_level::debug);
   const auto begin = measure
@@ -1600,7 +1605,6 @@ SeaStore::Shard::query_vectors(
     if (!select_log_omap_root(onode).is_null()) {
       return crimson::ct_error::input_output_error::make();
     }
-
     ceph::rados::vector_query_exec::local_query_accumulator_t accumulator;
     const auto prepare_begin = measure
       ? std::chrono::steady_clock::now()
@@ -1698,6 +1702,311 @@ SeaStore::Shard::query_vectors(
               crimson::ct_error::input_output_error::make());
         }),
         base_iertr::pass_further{});
+    });
+  }).finally([this] {
+    assert(shard_stats.pending_read_num);
+    --(shard_stats.pending_read_num);
+  });
+}
+
+SeaStore::Shard::read_errorator::future<
+  std::optional<ceph::rados::query_vectors_result_t>>
+SeaStore::Shard::query_vectors_tree_boundary(
+  CollectionRef ch,
+  const ghobject_t &anchor,
+  const ceph::rados::query_vectors_request_t &request,
+  uint32_t op_flags)
+{
+  LOG_PREFIX(SeaStoreS::query_vectors_tree_boundary);
+  ++(shard_stats.read_num);
+  ++(shard_stats.pending_read_num);
+
+  using namespace ceph::rados::vector_pg_lsh_boundary;
+  using ceph::rados::vector_pg_lsh_placement::distance_geometry_raw_euclidean_v1;
+  const auto &tb = *request.tree_boundary_search;
+
+  std::vector<float> query_values;
+  if (ceph::rados::vector_query_exec::copy_float32_values(
+        request.query_vector, request.dimension, &query_values) < 0) {
+    --(shard_stats.pending_read_num);
+    return crimson::ct_error::input_output_error::make();
+  }
+  const uint32_t geometry = tb.distance_geometry;
+  const double raw_scale = tb.raw_distance_scale_max;
+  // Never trust the pruning flag without a compatible distance geometry.
+  const bool enable_pruning =
+    tb.enable_pruning && geometry == distance_geometry_raw_euclidean_v1;
+  // Tau-based exclusion requires Dq to use the same raw metric as query
+  // result distances. The normalized geometry remains ordering-only.
+  auto boundary_state = geometry == distance_geometry_raw_euclidean_v1
+    ? compute_boundary_query_state_raw_euclidean(
+        query_values, tb.anchor, tb.seed, tb.residual_bits)
+    : compute_boundary_query_state(
+        query_values, tb.anchor, tb.seed, tb.residual_bits);
+  if (!boundary_state) {
+    --(shard_stats.pending_read_num);
+    return crimson::ct_error::input_output_error::make();
+  }
+  const double Dq = boundary_state->Dq;
+  const uint32_t bits = tb.distance_bucket_bits;
+  const uint32_t residual_bits = tb.residual_bits;
+  const uint32_t budget = tb.budget;
+  const uint32_t no_improve_patience = tb.no_improve_patience;
+  const uint32_t onode_budget = tb.onode_budget;
+
+  return seastar::do_with(
+    ceph::rados::query_vectors_result_t(),
+    anchor,
+    [this, ch, &request, Dq, bits, residual_bits, budget,
+     no_improve_patience, onode_budget,
+     geometry, raw_scale, enable_pruning, boundary_state, FNAME]
+    (auto &result, auto &anchor) {
+    return repeat_eagain([this, ch, &request, &result, Dq, bits,
+                          residual_bits, budget, no_improve_patience,
+                          onode_budget,
+                          geometry, raw_scale,
+                          enable_pruning, boundary_state, &anchor, FNAME] {
+      ++(shard_stats.repeat_read_num);
+      return transaction_manager->with_transaction_intr(
+        Transaction::src_t::READ,
+        "query_vectors_tree_boundary",
+        CACHE_HINT_TOUCH,
+        [this, ch, &request, &result, Dq, bits, residual_bits, budget,
+         no_improve_patience, onode_budget, geometry, raw_scale, enable_pruning,
+         boundary_state, &anchor, FNAME](auto &t) -> base_iertr::future<> {
+        return seastar::do_with(
+          ceph::rados::vector_query_exec::local_query_accumulator_t(),
+          onode_manager->create_tree_boundary_query(),
+          VectorNodeManager(
+            *transaction_manager,
+            crimson::common::get_conf<Option::size_t>(
+              "seastore_vector_node_list_block_bytes")),
+          uint32_t(0),
+          uint32_t(0),
+          [this, &t, &request, &result, Dq, bits, residual_bits, budget,
+           no_improve_patience, onode_budget, geometry, raw_scale, enable_pruning,
+           boundary_state, &anchor, FNAME]
+              (auto &accumulator, auto &boundary_query, auto &manager,
+               auto &expanded_count, auto &opened_onodes) -> base_iertr::future<> {
+            if (accumulator.prepare(request) < 0) {
+              return crimson::ct_error::input_output_error::make();
+            }
+
+            // Both range edges must belong to the anchor's tree-ordering
+            // PG band. Object names do not define that boundary.
+            auto in_anchor_pg = [anchor](const ghobject_t &b) {
+              return b.shard_id == anchor.shard_id &&
+                     b.hobj.pool == anchor.hobj.pool &&
+                     b.hobj.get_hash() == anchor.hobj.get_hash();
+            };
+            auto range_confined_to_anchor_pg =
+                [in_anchor_pg](const std::optional<ghobject_t> &lower,
+                                const std::optional<ghobject_t> &upper) {
+              return lower && upper &&
+                     in_anchor_pg(*lower) && in_anchor_pg(*upper);
+            };
+
+            // Normalized buckets are suitable only for ordering because tau
+            // is a raw Euclidean distance. Raw-Euclidean buckets share tau's
+            // metric space and can therefore safely exclude subtrees.
+            auto make_priority = [Dq, bits, residual_bits,
+                                   range_confined_to_anchor_pg, geometry,
+                                   raw_scale, enable_pruning]
+                (std::optional<float> tau) {
+              return crimson::os::seastore::tree_boundary_priority_fn_t(
+                [Dq, bits, residual_bits, range_confined_to_anchor_pg,
+                 geometry, raw_scale, enable_pruning, tau](
+                    const std::optional<ghobject_t> &lower,
+                    const std::optional<ghobject_t> &upper)
+                    -> std::optional<double> {
+                  if (!range_confined_to_anchor_pg(lower, upper)) {
+                    return std::nullopt;
+                  }
+                  auto buckets = conservative_bucket_range_for_child(
+                      lower, upper, bits, residual_bits);
+                  if (geometry == distance_geometry_raw_euclidean_v1) {
+                    if (enable_pruning && tau) {
+                      const auto bound = distance_bound_from_tau(Dq, *tau);
+                      if (!bucket_range_overlaps_bound_raw_euclidean(
+                              buckets, bits, raw_scale, bound)) {
+                        return std::nullopt;
+                      }
+                    }
+                    return min_possible_sq_distance_raw_euclidean(
+                        Dq, buckets, bits, raw_scale);
+                  }
+                  return min_possible_sq_distance(Dq, buckets, bits);
+                });
+            };
+
+            auto scan_one = [this, &t, &accumulator, &manager, &request,
+                              &opened_onodes, &anchor, boundary_state, geometry,
+                              enable_pruning, bits, residual_bits,
+                              onode_budget, FNAME]
+                (const crimson::os::seastore::tree_boundary_candidate_t &cand)
+                -> base_iertr::future<> {
+              // Candidate ordering makes an ONode budget discard the least
+              // promising entries first; it remains an approximate limit.
+              if (onode_budget && opened_onodes >= onode_budget) {
+                return base_iertr::now();
+              }
+              if (!cand.onode->has_vector_index()) {
+                return base_iertr::now();
+              }
+              // Residual pruning is safe on exact leaf keys in the raw
+              // projection space; internal ranges may span residual codes.
+              if (enable_pruning &&
+                  geometry == distance_geometry_raw_euclidean_v1 &&
+                  residual_bits != 0) {
+                auto tau_now = accumulator.current_tau();
+                if (tau_now) {
+                  auto sub_oid = split_anchor_sub_oid(
+                      cand.oid.hobj, bits, residual_bits);
+                  if (sub_oid) {
+                    auto mask = compute_residual_wildcard_mask(
+                        *boundary_state, *tau_now);
+                    if (!residual_matches(
+                            sub_oid->second.residual_code, mask)) {
+                      return base_iertr::now();
+                    }
+                  }
+                }
+              }
+              ++opened_onodes;
+              return manager.read_vector_node(
+                t, cand.onode->get_vector_index_laddr()
+              ).si_then([&manager, &request](auto index) {
+                return manager.find_group_head(
+                    std::move(index), request.dimension, request.data_type);
+              }).si_then([&t, &manager, &accumulator, &request]
+                  (auto head_laddr) -> VectorNodeManager::scan_ret {
+                if (!head_laddr) {
+                  return VectorNodeManager::read_iertr::make_ready_future<
+                      vector_scan_stats_t>(vector_scan_stats_t());
+                }
+                return manager.scan_vector_group(
+                    t, *head_laddr, request.dimension, request.data_type,
+                    [&accumulator, &request]
+                        (const VectorNodeRecordView &entry) {
+                      const int r = accumulator.consume(
+                          make_query_entry_view(request, entry));
+                      ceph_assert(r == 0);
+                    },
+                    false);
+              }).si_then([](auto) {
+                return seastar::now();
+              }).handle_error_interruptible(
+                crimson::ct_error::enoent::handle([] { return seastar::now(); }),
+                base_iertr::pass_further{});
+            };
+
+            return boundary_query->primary(
+                t, anchor, make_priority(accumulator.current_tau())
+            ).si_then([scan_one](auto candidates) {
+              return seastar::do_with(
+                std::move(candidates), scan_one,
+                [](auto &candidates, auto &scan_one) {
+                  return trans_intr::do_for_each(candidates, scan_one);
+              });
+            }).si_then([this, &t, &boundary_query, &accumulator, make_priority,
+                        scan_one, &expanded_count, &opened_onodes, budget,
+                        no_improve_patience, onode_budget,
+                        FNAME]() mutable {
+              // Consecutive expansions that did not improve tau. Reset on
+              // any improvement; the search stops once it exceeds
+              // no_improve_patience.
+              return seastar::do_with(uint32_t(0),
+                [this, &t, &boundary_query, &accumulator, make_priority,
+                 scan_one, &expanded_count, &opened_onodes, budget,
+                 no_improve_patience, onode_budget, FNAME]
+                    (auto &misses) mutable {
+              return trans_intr::repeat(
+                [this, &t, &boundary_query, &accumulator, make_priority,
+                 scan_one, &expanded_count, &opened_onodes, &misses, budget,
+                 no_improve_patience, onode_budget,
+                 FNAME]() mutable
+                    -> base_iertr::future<seastar::stop_iteration> {
+                if (expanded_count >= budget) {
+                  DEBUGT("tree_boundary_search: stop, budget exhausted "
+                         "(expanded={})", t, expanded_count);
+                  return base_iertr::make_ready_future<seastar::stop_iteration>(
+                      seastar::stop_iteration::yes);
+                }
+                if (onode_budget && opened_onodes >= onode_budget) {
+                  DEBUGT("tree_boundary_search: stop, onode budget exhausted "
+                         "(opened={})", t, opened_onodes);
+                  return base_iertr::make_ready_future<seastar::stop_iteration>(
+                      seastar::stop_iteration::yes);
+                }
+                return seastar::do_with(
+                  bool(false),
+                  accumulator.current_tau(),
+                  [this, &t, &boundary_query, &accumulator, make_priority,
+                   scan_one, &expanded_count, &misses, no_improve_patience,
+                   FNAME]
+                      (auto &has_more, auto &tau_before) {
+                  return boundary_query->expand_one(
+                      t, make_priority(tau_before), &has_more
+                  ).si_then([this, &t, &boundary_query, &accumulator,
+                             scan_one, &expanded_count, &tau_before, &misses,
+                             no_improve_patience, FNAME]
+                      (auto candidates) mutable
+                          -> base_iertr::future<seastar::stop_iteration> {
+                    if (candidates.empty()) {
+                      DEBUGT("tree_boundary_search: stop, frontier exhausted "
+                             "(expanded={})", t, expanded_count);
+                      return base_iertr::make_ready_future<seastar::stop_iteration>(
+                          seastar::stop_iteration::yes);
+                    }
+                    ++expanded_count;
+                    return seastar::do_with(
+                      std::move(candidates), scan_one,
+                      [this, &t, &boundary_query, &accumulator,
+                       &tau_before, &expanded_count, &misses,
+                       no_improve_patience, FNAME]
+                          (auto &candidates, auto &scan_one) {
+                      return trans_intr::do_for_each(candidates, scan_one
+                      ).si_then([this, &t, &boundary_query, &accumulator,
+                                 &tau_before, &expanded_count, &misses,
+                                 no_improve_patience, FNAME] {
+                        auto tau_after = accumulator.current_tau();
+                        const bool improved =
+                          ceph::rados::vector_query_exec::tree_boundary_tau_improved(
+                            tau_before, tau_after);
+                        if (!improved) {
+                          ++misses;
+                          if (misses <= no_improve_patience) {
+                            return seastar::stop_iteration::no;
+                          }
+                          DEBUGT("tree_boundary_search: stop, additional subtree "
+                                 "did not improve top-k (expanded={})",
+                                 t, expanded_count);
+                          return seastar::stop_iteration::yes;
+                        }
+                        misses = 0;
+                        return seastar::stop_iteration::no;
+                      });
+                    });
+                  });
+                });
+              });
+              });
+            }).si_then([&accumulator, &result]
+                () -> base_iertr::future<> {
+              ceph::rados::vector_query_exec::query_filter_stats_t filter_stats;
+              if (accumulator.finish(&result, &filter_stats) < 0) {
+                return crimson::ct_error::input_output_error::make();
+              }
+              result.local_matching_entries = filter_stats.matched_entries;
+              result.local_distance_computations =
+                  filter_stats.distance_computations;
+              return base_iertr::now();
+            });
+          });
+      });
+    }).safe_then([&result] {
+      return seastar::make_ready_future<
+          std::optional<ceph::rados::query_vectors_result_t>>(std::move(result));
     });
   }).finally([this] {
     assert(shard_stats.pending_read_num);

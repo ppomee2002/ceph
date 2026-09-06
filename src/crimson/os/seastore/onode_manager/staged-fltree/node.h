@@ -156,6 +156,11 @@ class tree_cursor_t final
     return INVALID;
   }
 
+  // For traversal drivers outside the Node hierarchy, which cannot be
+  // friends of tree_cursor_t. Same information LeafNode uses internally.
+  search_position_t get_position_ro() const { return position; }
+  Ref<LeafNode> get_leaf_node_ro() const { return ref_leaf_node; }
+
  private:
   // create from insert
   tree_cursor_t(Ref<LeafNode>, const search_position_t&);
@@ -521,6 +526,92 @@ class InternalNode final : public Node {
   eagain_ifuture<std::pair<Ref<Node>, Ref<Node>>> get_child_peers(
       context_t, const search_position_t&);
 
+  /**
+   * Read-only subtree range primitives.
+   *
+   * child_range_t is the key range a child subtree covers, following the
+   * "parent key == left child's largest key" invariant documented at the
+   * top of this file. A non-tail child at `pos` covers
+   * (lower_excl, upper_incl], where upper_incl is this node's stored key
+   * at `pos` and lower_excl is the previous sibling's stored key, or
+   * nullopt for -infinity at the first slot. The tail child has no stored
+   * key and covers (lower_excl, +infinity).
+   *
+   * The bounds are plain ghobject_t; callers at the OnodeManager layer
+   * decode them into whatever range they need.
+   */
+  struct child_range_t {
+    Ref<Node> node;
+    search_position_t pos;
+    std::optional<ghobject_t> lower_excl;
+    std::optional<ghobject_t> upper_incl;
+  };
+
+  /// One-level child lookup for `key`. Makes the same impl->lower_bound()
+  /// call lower_bound_tracked() does, but returns the child and its range
+  /// instead of recursing into it.
+  eagain_ifuture<child_range_t> get_primary_child_range(
+      context_t, const key_hobj_t& key, MatchHistory& history);
+
+  /// Previous/next sibling of the child at `pos`, with its range. Never
+  /// looks above this node.
+  eagain_ifuture<std::optional<child_range_t>> get_prev_child_range(
+      context_t, const search_position_t& pos);
+  eagain_ifuture<std::optional<child_range_t>> get_next_child_range(
+      context_t, const search_position_t& pos);
+
+  /**
+   * child_probe_t / enumerate_left_slot()
+   *
+   * A child's key range read from this node's separator keys, without
+   * loading the child extent. Same (lower_excl, upper_incl] convention as
+   * child_range_t; `pos.is_end()` is the level-tail child, whose
+   * upper_incl is nullopt.
+   *
+   * enumerate_left_slot() returns the children that can hold a key sharing
+   * `key`'s STAGE_LEFT component (shard/pool/crush). An N0 node's slot key
+   * is shard_pool_crush_t (stages/node_stage_layout.h's slot_0_t) and
+   * separators sort on that component first, so those children are a
+   * contiguous run. A child at `pos` qualifies when its lower bound's band
+   * is <= the key's and its upper bound's band >=, which admits the run of
+   * children whose separator is in the slot plus the one immediately
+   * after: a separator is the largest key of the child below it, so that
+   * child holds the tail of the run even though its own separator belongs
+   * to the next band.
+   *
+   * Synchronous; it only reads separators from this node's resident
+   * extent. Callers materialize the probes they want via
+   * materialize_child().
+   */
+  struct child_probe_t {
+    search_position_t pos;
+    std::optional<ghobject_t> lower_excl;
+    std::optional<ghobject_t> upper_incl;
+    /// True when this node stores a separator for `pos` in the enumerated
+    /// key's STAGE_LEFT band. False for the trailing and tail children,
+    /// which are included because they can hold the end of the run.
+    bool in_slot = false;
+  };
+
+  void enumerate_left_slot(
+      const key_hobj_t& key,
+      const search_position_t& from,
+      unsigned limit,
+      std::vector<child_probe_t>& out,
+      bool* truncated = nullptr) const;
+
+  /// Loads the child a child_probe_t refers to, as the same child_range_t
+  /// the get_*_child_range() helpers return.
+  eagain_ifuture<child_range_t> materialize_child(
+      context_t, const child_probe_t& probe);
+
+  /// lookup_largest() above asserts is_level_tail() and so only works on a
+  /// node that is its parent's tail child. This works on any InternalNode:
+  /// it descends into the tail child when there is one and the last stored
+  /// slot otherwise. For callers holding a subtree they did not descend
+  /// into, such as a discovered sibling.
+  eagain_ifuture<Ref<tree_cursor_t>> lookup_largest_unconditional(context_t);
+
   eagain_ifuture<> erase_child(context_t, Ref<Node>&&);
 
   template <bool FORCE_MERGE = false>
@@ -628,6 +719,45 @@ class LeafNode final : public Node {
   extent_len_t get_node_size() const;
   std::tuple<key_view_t, const value_header_t*> get_kv(const search_position_t&) const;
   eagain_ifuture<Ref<tree_cursor_t>> get_next_cursor(context_t, const search_position_t&);
+
+  /**
+   * Read-only leaf-local entry primitives.
+   *
+   * Unlike get_next_cursor() above, these never cross into a sibling leaf:
+   * get_prev_entry_local()/get_next_entry_local() return nullopt at this
+   * leaf's boundary instead of walking up to the parent, which keeps
+   * visiting neighbors within one already-loaded page.
+   */
+  struct entry_t {
+    Ref<tree_cursor_t> cursor;
+    ghobject_t key;
+  };
+
+  /// Public forwarder to lower_bound_tracked(), whose LeafNode override is
+  /// already self-contained. Returns a materialized ghobject_t rather than
+  /// a search_result_t so callers outside the Node hierarchy need no
+  /// value_magic_t of their own. nullopt on a miss or at end.
+  eagain_ifuture<std::optional<entry_t>> get_primary_entry(
+      context_t, const key_hobj_t& key, MatchHistory& history);
+
+  std::optional<entry_t> get_prev_entry_local(const search_position_t& pos);
+  std::optional<entry_t> get_next_entry_local(const search_position_t& pos);
+
+  /**
+   * Previous/next sibling of this leaf under its own parent, with that
+   * sibling's key range. nullopt when this leaf is the root or is its
+   * parent's first or tail child, since the neighbor then lives under the
+   * grandparent and this lookup only goes up one level.
+   *
+   * Forwarders to InternalNode::get_prev_child_range()/
+   * get_next_child_range(), so a caller outside the Node hierarchy can
+   * continue a key-order traversal past this page, which
+   * get_prev_entry_local()/get_next_entry_local() above will not do.
+   */
+  eagain_ifuture<std::optional<InternalNode::child_range_t>>
+  get_prev_sibling_range(context_t);
+  eagain_ifuture<std::optional<InternalNode::child_range_t>>
+  get_next_sibling_range(context_t);
 
   /**
    * erase

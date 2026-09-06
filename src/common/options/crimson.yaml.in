@@ -210,6 +210,30 @@ options:
   default: 16384
   flags:
   - startup
+- name: seastore_vector_node_boundary_search_max_candidates
+  type: uint
+  level: dev
+  desc: Safety ceiling on the number of additional ONodes a boundary-aware
+        pg-lsh-v0 query_vectors call may scan within one PG, on top of the
+        initial ONode
+  long_desc: Bounds worst-case per-op cost for the adaptive expansion in
+             PGBackend::query_vectors (see common/vector_pg_lsh_boundary.h);
+             hitting it stops the search early (a bounded-search
+             termination, not the correctness termination reached when no
+             admissible unvisited ONode remains). The client-supplied
+             vector_routing_policy_t::max_candidates, when nonzero, is
+             combined with this as an additional (tighter or looser) cap
+             per query.
+  default: 64
+- name: seastore_vector_node_boundary_search_batch_size
+  type: uint
+  level: dev
+  desc: Number of ONodes requested per PGBackend::list_objects call while
+        expanding a boundary-aware pg-lsh-v0 query
+  long_desc: Purely a pagination chunk size for the list_objects range scan;
+             does not bound total work by itself (see
+             seastore_vector_node_boundary_search_max_candidates for that).
+  default: 32
 # TODO: implement sub-extent checksum and deprecate this configuration.
 - name: seastore_full_integrity_check
   type: bool

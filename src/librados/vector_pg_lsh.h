@@ -41,6 +41,15 @@ inline constexpr uint32_t index_config_format_version = 1;
 // "v0" identifies the first immutable PG-LSH placement/routing layout. A
 // future incompatible mapping must use a new layout version and algorithm ID.
 inline constexpr uint32_t pg_lsh_layout_version = 0;
+// Second immutable layout. PG routing (k/l/d/seed) is identical to v0;
+// only sub_oid distance_bucket placement differs, using raw Euclidean
+// distance from the anchor instead of v0's normalized angular distance.
+// Tree-boundary pruning needs distance_bucket and tau in the same metric
+// space, which the normalized distance does not give. Requires
+// distance_metric == euclidean and raw_distance_scale_max > 0; see
+// validate_index_config(). v0 indexes keep their own layout version and
+// are not affected.
+inline constexpr uint32_t pg_lsh_layout_version_raw_euclidean_v1 = 1;
 
 inline constexpr uint32_t anchor_mode_random = 1;
 inline constexpr uint32_t anchor_mode_centroid = 2;
@@ -68,6 +77,10 @@ struct index_config_t {
   uint32_t residual_bits = 0;
   uint32_t anchor_mode = 0;
   std::vector<double> anchor;
+  // Quantization scale for the raw ||v-anchor||^2 -> distance_bucket
+  // mapping. Must be > 0 for the raw-Euclidean layout and 0 for v0; see
+  // validate_index_config(). Persisted so put and query agree on it.
+  double raw_distance_scale_max = 0;
 
   void encode(ceph::bufferlist& bl) const {
     ENCODE_START(1, 1, bl);
@@ -88,6 +101,7 @@ struct index_config_t {
     encode(residual_bits, bl);
     encode(anchor_mode, bl);
     encode(anchor, bl);
+    encode(raw_distance_scale_max, bl);
     ENCODE_FINISH(bl);
   }
 
@@ -110,6 +124,7 @@ struct index_config_t {
     decode(residual_bits, p);
     decode(anchor_mode, p);
     decode(anchor, p);
+    decode(raw_distance_scale_max, p);
     DECODE_FINISH(p);
   }
 };
@@ -121,6 +136,33 @@ struct query_params_t {
   uint32_t distance_bucket_radius = 0;
   uint32_t residual_hamming_radius = 0;
   uint32_t probe_limit_per_pg = 0;
+  // Send one probe per selected PG (the query's exact sub_oid) and let
+  // the OSD expand neighboring ONodes, instead of expanding the
+  // Hamming ball on the client. Requires distance_bucket_radius and
+  // residual_hamming_radius to be 0, since running both would scan
+  // overlapping key space. PG selection is unaffected.
+  bool server_side_boundary_search = false;
+  // Max additional FLTree subtrees the OSD may expand beyond the primary
+  // path, visited best-first; 0 disables it. Separate mechanism from
+  // server_side_boundary_search above, which scans neighboring sub_oids
+  // in a flat key range. The two are mutually exclusive.
+  uint32_t tree_boundary_search_budget = 0;
+  // Skip subtrees that cannot hold a result within tau, rather than only
+  // reordering them. Requires tree_boundary_search_budget > 0 and the
+  // raw-Euclidean layout, the only one where distance_bucket and tau
+  // share a metric space. False keeps best-first ordering alone.
+  bool tree_boundary_search_prune = false;
+  // Consecutive non-improving subtree expansions tolerated before the OSD
+  // stops expanding a probe. 0 stops at the first one.
+  uint32_t tree_boundary_search_no_improve_patience = 0;
+  // Max ONodes the OSD may open per probe; 0 is unlimited. Setting it
+  // makes the search approximate: it caps cost, it does not bound how
+  // much of the result set is missed.
+  uint32_t tree_boundary_search_onode_budget = 0;
+  // Query-side PG selection and ordering. Changes which PGs a query
+  // visits, never where a vector is stored, so it can be changed on an
+  // index that is already populated.
+  vector_placement::pg_lsh_v0_query_routing_t query_routing;
 };
 
 // Query callers normally provide no immutable overrides. These optionals are
@@ -192,7 +234,9 @@ inline int validate_index_config(const index_config_t& config,
     set_mismatch_field(invalid_field, "placement_algorithm");
     return -EINVAL;
   }
-  if (config.placement_layout_version != pg_lsh_layout_version) {
+  if (config.placement_layout_version != pg_lsh_layout_version &&
+      config.placement_layout_version !=
+        pg_lsh_layout_version_raw_euclidean_v1) {
     set_mismatch_field(invalid_field, "placement_layout_version");
     return -EINVAL;
   }
@@ -265,6 +309,27 @@ inline int validate_index_config(const index_config_t& config,
     set_mismatch_field(invalid_field, "anchor");
     return -EINVAL;
   }
+  if (config.placement_layout_version ==
+      pg_lsh_layout_version_raw_euclidean_v1) {
+    // tau is Euclidean regardless of distance_metric, so it only matches
+    // the metric this index ranks by when that metric is euclidean.
+    // Reject cosine/dot here rather than mis-scoring at query time.
+    if (config.distance_metric != ceph::rados::vector_distance_metric_euclidean) {
+      set_mismatch_field(invalid_field, "distance_metric");
+      return -EINVAL;
+    }
+    if (!(config.raw_distance_scale_max > 0) ||
+        !std::isfinite(config.raw_distance_scale_max)) {
+      set_mismatch_field(invalid_field, "raw_distance_scale_max");
+      return -EINVAL;
+    }
+  } else if (config.raw_distance_scale_max != 0) {
+    // v0's normalized angular geometry has no scale parameter, so a
+    // nonzero value here usually means the caller forgot to set
+    // placement_layout_version.
+    set_mismatch_field(invalid_field, "raw_distance_scale_max");
+    return -EINVAL;
+  }
   if (config.d > pool_info.pg_num) {
     set_mismatch_field(invalid_field, "d");
     return -EINVAL;
@@ -293,6 +358,12 @@ inline int validate_query_params(const index_config_t& config,
     set_mismatch_field(invalid_field, "residual_hamming_radius");
     return -EINVAL;
   }
+  if (query_params.query_routing.table_count > config.l) {
+    // Restricting to more tables than the index has is a caller mistake,
+    // not a silently clamped no-op.
+    set_mismatch_field(invalid_field, "query_routing_table_count");
+    return -EINVAL;
+  }
   if (config.distance_bucket_bits == 0 &&
       query_params.distance_bucket_radius != 0) {
     set_mismatch_field(invalid_field, "distance_bucket_radius");
@@ -303,6 +374,44 @@ inline int validate_query_params(const index_config_t& config,
       query_params.probe_limit_per_pg != 0) {
     set_mismatch_field(invalid_field, "probe_limit_per_pg");
     return -EINVAL;
+  }
+  if (query_params.server_side_boundary_search) {
+    // Client-side Hamming-ball expansion and the OSD's own expansion
+    // must not both run against the same PG.
+    if (query_params.distance_bucket_radius != 0) {
+      set_mismatch_field(invalid_field, "distance_bucket_radius");
+      return -EINVAL;
+    }
+    if (query_params.residual_hamming_radius != 0) {
+      set_mismatch_field(invalid_field, "residual_hamming_radius");
+      return -EINVAL;
+    }
+    if (!vector_placement::pg_lsh_v0::sub_oid_enabled(
+          config.distance_bucket_bits, config.residual_bits)) {
+      set_mismatch_field(invalid_field, "server_side_boundary_search");
+      return -EINVAL;
+    }
+  }
+  if (query_params.tree_boundary_search_budget != 0 &&
+      query_params.server_side_boundary_search) {
+    // Two independent boundary-search mechanisms; never combine them on
+    // the same query.
+    set_mismatch_field(invalid_field, "tree_boundary_search_budget");
+    return -EINVAL;
+  }
+  if (query_params.tree_boundary_search_prune) {
+    if (query_params.tree_boundary_search_budget == 0) {
+      set_mismatch_field(invalid_field, "tree_boundary_search_prune");
+      return -EINVAL;
+    }
+    if (config.placement_layout_version !=
+        pg_lsh_layout_version_raw_euclidean_v1) {
+      // Pruning needs distance_bucket and tau in the same metric space,
+      // which only the raw-Euclidean layout provides. Reject rather than
+      // falling back to best-first-only on the OSD.
+      set_mismatch_field(invalid_field, "tree_boundary_search_prune");
+      return -EINVAL;
+    }
   }
   return 0;
 }
@@ -340,6 +449,7 @@ inline int compare_index_configs(const index_config_t& requested,
   CHECK_INDEX_CONFIG_FIELD(residual_bits);
   CHECK_INDEX_CONFIG_FIELD(anchor_mode);
   CHECK_INDEX_CONFIG_FIELD(anchor);
+  CHECK_INDEX_CONFIG_FIELD(raw_distance_scale_max);
 #undef CHECK_INDEX_CONFIG_FIELD
   if (mismatch_field != nullptr) {
     mismatch_field->clear();
@@ -406,6 +516,10 @@ inline vector_placement::pg_lsh_v0::sub_oid_config_t sub_oid_config_view(
     config.distance_bucket_bits,
     config.residual_bits,
     std::span<const double>(config.anchor),
+    config.placement_layout_version == pg_lsh_layout_version_raw_euclidean_v1
+      ? ceph::rados::vector_pg_lsh_placement::distance_geometry_raw_euclidean_v1
+      : ceph::rados::vector_pg_lsh_placement::distance_geometry_normalized_angular_v0,
+    config.raw_distance_scale_max,
   };
 }
 
@@ -665,9 +779,10 @@ inline int select_query_pgs(
   }
 
   std::vector<vector_placement::pg_lsh_v0_group_t> groups;
-  ret = vector_placement::pg_lsh_v0_query_groups(
+  ret = vector_placement::pg_lsh_v0_query_groups_routed(
       query_vector, config.dimension, config.k, config.l,
-      query_params.hamming_radius, config.seed, &groups);
+      query_params.hamming_radius, config.seed,
+      query_params.query_routing, &groups);
   if (ret < 0) {
     return ret;
   }
@@ -735,6 +850,48 @@ inline int build_put_targets(const std::string& bucket_name,
   return 0;
 }
 
+// sub_oid selection for build_query_probes(). Split out because it depends
+// only on (query_vector, config, query_params) and not on PG routing, so it
+// can be tested without an ioctx. Under server_side_boundary_search it
+// returns the exact sub_oid alone; validate_query_params() has already
+// rejected a nonzero radius in that mode.
+inline int select_probe_sub_oids(const ceph::bufferlist& query_vector,
+                                 const index_config_t& config,
+                                 const query_params_t& query_params,
+                                 std::vector<std::string> *probe_sub_oids)
+{
+  if (probe_sub_oids == nullptr) {
+    return -EINVAL;
+  }
+  probe_sub_oids->clear();
+
+  if (!vector_placement::pg_lsh_v0::sub_oid_enabled(
+        config.distance_bucket_bits, config.residual_bits)) {
+    probe_sub_oids->emplace_back();
+    return 0;
+  }
+
+  vector_placement::pg_lsh_v0::sub_oid_t exact_sub_oid;
+  int ret = compute_sub_oid(query_vector, config, &exact_sub_oid);
+  if (ret < 0) {
+    return ret;
+  }
+
+  if (query_params.server_side_boundary_search) {
+    probe_sub_oids->push_back(vector_placement::pg_lsh_v0::format_sub_oid(
+        exact_sub_oid, sub_oid_config_view(config)));
+    return 0;
+  }
+
+  const vector_placement::pg_lsh_v0::probe_config_t probe_config = {
+    query_params.distance_bucket_radius,
+    query_params.residual_hamming_radius,
+  };
+  return vector_placement::pg_lsh_v0::build_probe_sub_oids(
+      exact_sub_oid, sub_oid_config_view(config), probe_config,
+      probe_sub_oids);
+}
+
 inline int build_query_probes(const std::string& bucket_name,
                               const std::string& index_name,
                               const ceph::bufferlist& query_vector,
@@ -768,25 +925,10 @@ inline int build_query_probes(const std::string& bucket_name,
   }
 
   std::vector<std::string> probe_sub_oids;
-  if (vector_placement::pg_lsh_v0::sub_oid_enabled(
-        config.distance_bucket_bits, config.residual_bits)) {
-    vector_placement::pg_lsh_v0::sub_oid_t exact_sub_oid;
-    ret = compute_sub_oid(query_vector, config, &exact_sub_oid);
-    if (ret < 0) {
-      return ret;
-    }
-    const vector_placement::pg_lsh_v0::probe_config_t probe_config = {
-      query_params.distance_bucket_radius,
-      query_params.residual_hamming_radius,
-    };
-    ret = vector_placement::pg_lsh_v0::build_probe_sub_oids(
-        exact_sub_oid, sub_oid_config_view(config), probe_config,
-        &probe_sub_oids);
-    if (ret < 0) {
-      return ret;
-    }
-  } else {
-    probe_sub_oids.emplace_back();
+  ret = select_probe_sub_oids(
+      query_vector, config, query_params, &probe_sub_oids);
+  if (ret < 0) {
+    return ret;
   }
 
   probes->reserve(ranked.size() * probe_sub_oids.size());
@@ -821,6 +963,62 @@ inline int build_query_probes(const std::string& bucket_name,
     }
   }
   return 0;
+}
+
+// Fills req.boundary_search so the OSD can recompute Dmin/Dmax and the
+// residual wildcard mask itself. Left unset unless the query asked for
+// server-side boundary search, so a plain probe carries no extra bytes.
+inline void apply_boundary_search_config(
+    const index_config_t& config,
+    const query_params_t& query_params,
+    ceph::rados::query_vectors_request_t *req)
+{
+  if (req == nullptr) {
+    return;
+  }
+  if (!query_params.server_side_boundary_search) {
+    req->boundary_search.reset();
+    return;
+  }
+  ceph::rados::vector_boundary_search_config_t boundary;
+  boundary.anchor = config.anchor;
+  boundary.seed = config.seed;
+  boundary.distance_bucket_bits = config.distance_bucket_bits;
+  boundary.residual_bits = config.residual_bits;
+  req->boundary_search = std::move(boundary);
+}
+
+// Same as apply_boundary_search_config() above, for the independent
+// tree-traversal mechanism.
+inline void apply_tree_boundary_search_config(
+    const index_config_t& config,
+    const query_params_t& query_params,
+    ceph::rados::query_vectors_request_t *req)
+{
+  if (req == nullptr) {
+    return;
+  }
+  if (query_params.tree_boundary_search_budget == 0) {
+    req->tree_boundary_search.reset();
+    return;
+  }
+  ceph::rados::vector_tree_boundary_search_config_t tree_boundary;
+  tree_boundary.anchor = config.anchor;
+  tree_boundary.seed = config.seed;
+  tree_boundary.distance_bucket_bits = config.distance_bucket_bits;
+  tree_boundary.residual_bits = config.residual_bits;
+  tree_boundary.budget = query_params.tree_boundary_search_budget;
+  tree_boundary.distance_geometry =
+    config.placement_layout_version == pg_lsh_layout_version_raw_euclidean_v1
+      ? ceph::rados::vector_pg_lsh_placement::distance_geometry_raw_euclidean_v1
+      : ceph::rados::vector_pg_lsh_placement::distance_geometry_normalized_angular_v0;
+  tree_boundary.raw_distance_scale_max = config.raw_distance_scale_max;
+  tree_boundary.enable_pruning = query_params.tree_boundary_search_prune;
+  tree_boundary.no_improve_patience =
+      query_params.tree_boundary_search_no_improve_patience;
+  tree_boundary.onode_budget =
+      query_params.tree_boundary_search_onode_budget;
+  req->tree_boundary_search = std::move(tree_boundary);
 }
 
 inline int verify_probe_locator(v14_2_0::IoCtx& ioctx,

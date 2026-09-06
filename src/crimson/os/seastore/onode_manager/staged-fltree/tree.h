@@ -238,6 +238,19 @@ class Btree {
   }
 
   /*
+   * Read-only subtree access, for callers driving their own level-by-level
+   * descent via Node::child_range_t / LeafNode::entry_t instead of the
+   * single-path lower_bound() above. Forwarders to the private root and
+   * context accessors.
+   */
+  eagain_ifuture<Ref<Node>> get_root_node(Transaction& t) {
+    return get_root(t);
+  }
+  context_t get_node_context(Transaction& t) {
+    return get_context(t);
+  }
+
+  /*
    * modifiers
    */
 

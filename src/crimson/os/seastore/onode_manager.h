@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <functional>
 #include <iostream>
+#include <optional>
 
 #include <boost/intrusive_ptr.hpp>
 #include <boost/smart_ptr/intrusive_ref_counter.hpp>
@@ -20,6 +22,61 @@
 #include "crimson/osd/exceptions.h"
 
 namespace crimson::os::seastore {
+
+/**
+ * TreeBoundaryQuery
+ *
+ * Driver for query-directed multi-path descent over one OnodeManager-backed
+ * key tree. The caller supplies a priority function over a subtree's
+ * (lower_excl, upper_incl] ghobject_t key range, nullopt at either end
+ * meaning -/+infinity; this object owns the frontier of sibling subtrees
+ * discovered so far. The only current caller is seastore.cc's
+ * query_vectors(), which passes `priority` as a closure over its own
+ * Dq/tau.
+ *
+ * priority() returning nullopt means the subtree cannot hold anything
+ * acceptable and is not explored. Otherwise the result is a sort key with
+ * smaller meaning more promising; its units are up to the caller.
+ */
+struct tree_boundary_candidate_t {
+  OnodeRef onode;
+  ghobject_t oid;
+};
+
+using tree_boundary_priority_fn_t = std::function<
+  std::optional<double>(
+    const std::optional<ghobject_t>& lower_excl,
+    const std::optional<ghobject_t>& upper_incl)>;
+
+class TreeBoundaryQuery {
+public:
+  using iertr = base_iertr;
+  using ret = iertr::future<std::vector<tree_boundary_candidate_t>>;
+
+  virtual ~TreeBoundaryQuery() = default;
+
+  /// Descends to `anchor`'s exact key and returns it plus every accepted
+  /// neighboring entry in that same leaf page, never a sibling leaf.
+  /// Sibling subtrees found along the way are enqueued for later
+  /// expand_one() calls. Call at most once, before any expand_one().
+  virtual ret primary(
+    Transaction &t,
+    const ghobject_t &anchor,
+    tree_boundary_priority_fn_t priority) = 0;
+
+  /// Pops and descends the most promising pending subtree. `priority` is
+  /// re-evaluated here because the caller's bound may have narrowed since
+  /// the entry was enqueued; entries it now rejects are dropped without
+  /// counting against the caller's budget. Sets *has_more to whether any
+  /// still-accepted entry remains. Returns an empty vector if nothing was
+  /// popped.
+  virtual ret expand_one(
+    Transaction &t,
+    tree_boundary_priority_fn_t priority,
+    bool *has_more) = 0;
+
+};
+using TreeBoundaryQueryRef = std::unique_ptr<TreeBoundaryQuery>;
 
 class OnodeManager {
 public:
@@ -71,6 +128,10 @@ public:
     const ghobject_t& start,
     const ghobject_t& end,
     uint64_t limit) = 0;
+
+  /// See TreeBoundaryQuery above. Each instance holds the frontier state
+  /// for one query, unlike this long-lived per-shard OnodeManager.
+  virtual TreeBoundaryQueryRef create_tree_boundary_query() = 0;
 
   virtual ~OnodeManager() {}
 };

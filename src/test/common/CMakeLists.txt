@@ -242,6 +242,34 @@ add_executable(unittest_bit_vector
 add_ceph_unittest(unittest_bit_vector)
 target_link_libraries(unittest_bit_vector ceph-common)
 
+# unittest_vector_pg_lsh_boundary
+add_executable(unittest_vector_pg_lsh_boundary
+  test_vector_pg_lsh_boundary.cc
+  )
+add_ceph_unittest(unittest_vector_pg_lsh_boundary)
+target_link_libraries(unittest_vector_pg_lsh_boundary ceph-common)
+
+# unittest_vector_query_exec
+add_executable(unittest_vector_query_exec
+  test_vector_query_exec.cc
+  )
+add_ceph_unittest(unittest_vector_query_exec)
+target_link_libraries(unittest_vector_query_exec ceph-common)
+
+# unittest_vector_pg_lsh_query_routing
+add_executable(unittest_vector_pg_lsh_query_routing
+  test_vector_pg_lsh_query_routing.cc
+  )
+add_ceph_unittest(unittest_vector_pg_lsh_query_routing)
+target_link_libraries(unittest_vector_pg_lsh_query_routing ceph-common)
+
+# unittest_vector_selective_fanout
+add_executable(unittest_vector_selective_fanout
+  test_vector_selective_fanout.cc
+  )
+add_ceph_unittest(unittest_vector_selective_fanout)
+target_link_libraries(unittest_vector_selective_fanout ceph-common)
+
 # unittest_interval_map
 add_executable(unittest_interval_map
   test_interval_map.cc
