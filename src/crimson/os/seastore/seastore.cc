@@ -1751,15 +1751,20 @@ SeaStore::Shard::query_vectors_tree_boundary(
   const uint32_t bits = tb.distance_bucket_bits;
   const uint32_t residual_bits = tb.residual_bits;
   const uint32_t budget = tb.budget;
+  const uint32_t no_improve_patience = tb.no_improve_patience;
+  const uint32_t onode_budget = tb.onode_budget;
 
   return seastar::do_with(
     ceph::rados::query_vectors_result_t(),
     anchor,
-    [this, ch, &request, Dq, bits, residual_bits, budget, geometry,
-     raw_scale, enable_pruning, boundary_state, FNAME]
+    [this, ch, &request, Dq, bits, residual_bits, budget,
+     no_improve_patience, onode_budget,
+     geometry, raw_scale, enable_pruning, boundary_state, FNAME]
     (auto &result, auto &anchor) {
     return repeat_eagain([this, ch, &request, &result, Dq, bits,
-                          residual_bits, budget, geometry, raw_scale,
+                          residual_bits, budget, no_improve_patience,
+                          onode_budget,
+                          geometry, raw_scale,
                           enable_pruning, boundary_state, &anchor, FNAME] {
       ++(shard_stats.repeat_read_num);
       return transaction_manager->with_transaction_intr(
@@ -1767,8 +1772,8 @@ SeaStore::Shard::query_vectors_tree_boundary(
         "query_vectors_tree_boundary",
         CACHE_HINT_TOUCH,
         [this, ch, &request, &result, Dq, bits, residual_bits, budget,
-         geometry, raw_scale, enable_pruning, boundary_state,
-         &anchor, FNAME](auto &t) -> base_iertr::future<> {
+         no_improve_patience, onode_budget, geometry, raw_scale, enable_pruning,
+         boundary_state, &anchor, FNAME](auto &t) -> base_iertr::future<> {
         return seastar::do_with(
           ceph::rados::vector_query_exec::local_query_accumulator_t(),
           onode_manager->create_tree_boundary_query(),
@@ -1777,11 +1782,12 @@ SeaStore::Shard::query_vectors_tree_boundary(
             crimson::common::get_conf<Option::size_t>(
               "seastore_vector_node_list_block_bytes")),
           uint32_t(0),
+          uint32_t(0),
           [this, &t, &request, &result, Dq, bits, residual_bits, budget,
-           geometry, raw_scale, enable_pruning, boundary_state,
-           &anchor, FNAME]
+           no_improve_patience, onode_budget, geometry, raw_scale, enable_pruning,
+           boundary_state, &anchor, FNAME]
               (auto &accumulator, auto &boundary_query, auto &manager,
-               auto &expanded_count) -> base_iertr::future<> {
+               auto &expanded_count, auto &opened_onodes) -> base_iertr::future<> {
             if (accumulator.prepare(request) < 0) {
               return crimson::ct_error::input_output_error::make();
             }
@@ -1834,10 +1840,16 @@ SeaStore::Shard::query_vectors_tree_boundary(
             };
 
             auto scan_one = [this, &t, &accumulator, &manager, &request,
-                              boundary_state, geometry, enable_pruning, bits,
-                              residual_bits, FNAME]
+                              &opened_onodes, &anchor, boundary_state, geometry,
+                              enable_pruning, bits, residual_bits,
+                              onode_budget, FNAME]
                 (const crimson::os::seastore::tree_boundary_candidate_t &cand)
                 -> base_iertr::future<> {
+              // Candidate ordering makes an ONode budget discard the least
+              // promising entries first; it remains an approximate limit.
+              if (onode_budget && opened_onodes >= onode_budget) {
+                return base_iertr::now();
+              }
               if (!cand.onode->has_vector_index()) {
                 return base_iertr::now();
               }
@@ -1860,6 +1872,7 @@ SeaStore::Shard::query_vectors_tree_boundary(
                   }
                 }
               }
+              ++opened_onodes;
               return manager.read_vector_node(
                 t, cand.onode->get_vector_index_laddr()
               ).si_then([&manager, &request](auto index) {
@@ -1896,10 +1909,22 @@ SeaStore::Shard::query_vectors_tree_boundary(
                   return trans_intr::do_for_each(candidates, scan_one);
               });
             }).si_then([this, &t, &boundary_query, &accumulator, make_priority,
-                        scan_one, &expanded_count, budget, FNAME]() mutable {
+                        scan_one, &expanded_count, &opened_onodes, budget,
+                        no_improve_patience, onode_budget,
+                        FNAME]() mutable {
+              // Consecutive expansions that did not improve tau. Reset on
+              // any improvement; the search stops once it exceeds
+              // no_improve_patience.
+              return seastar::do_with(uint32_t(0),
+                [this, &t, &boundary_query, &accumulator, make_priority,
+                 scan_one, &expanded_count, &opened_onodes, budget,
+                 no_improve_patience, onode_budget, FNAME]
+                    (auto &misses) mutable {
               return trans_intr::repeat(
                 [this, &t, &boundary_query, &accumulator, make_priority,
-                 scan_one, &expanded_count, budget, FNAME]() mutable
+                 scan_one, &expanded_count, &opened_onodes, &misses, budget,
+                 no_improve_patience, onode_budget,
+                 FNAME]() mutable
                     -> base_iertr::future<seastar::stop_iteration> {
                 if (expanded_count >= budget) {
                   DEBUGT("tree_boundary_search: stop, budget exhausted "
@@ -1907,16 +1932,24 @@ SeaStore::Shard::query_vectors_tree_boundary(
                   return base_iertr::make_ready_future<seastar::stop_iteration>(
                       seastar::stop_iteration::yes);
                 }
+                if (onode_budget && opened_onodes >= onode_budget) {
+                  DEBUGT("tree_boundary_search: stop, onode budget exhausted "
+                         "(opened={})", t, opened_onodes);
+                  return base_iertr::make_ready_future<seastar::stop_iteration>(
+                      seastar::stop_iteration::yes);
+                }
                 return seastar::do_with(
                   bool(false),
                   accumulator.current_tau(),
                   [this, &t, &boundary_query, &accumulator, make_priority,
-                   scan_one, &expanded_count, FNAME]
+                   scan_one, &expanded_count, &misses, no_improve_patience,
+                   FNAME]
                       (auto &has_more, auto &tau_before) {
                   return boundary_query->expand_one(
                       t, make_priority(tau_before), &has_more
-                  ).si_then([this, &t, &accumulator, scan_one,
-                             &expanded_count, &tau_before, FNAME]
+                  ).si_then([this, &t, &boundary_query, &accumulator,
+                             scan_one, &expanded_count, &tau_before, &misses,
+                             no_improve_patience, FNAME]
                       (auto candidates) mutable
                           -> base_iertr::future<seastar::stop_iteration> {
                     if (candidates.empty()) {
@@ -1928,26 +1961,35 @@ SeaStore::Shard::query_vectors_tree_boundary(
                     ++expanded_count;
                     return seastar::do_with(
                       std::move(candidates), scan_one,
-                      [this, &t, &accumulator, &tau_before, &expanded_count,
-                       FNAME](auto &candidates, auto &scan_one) {
+                      [this, &t, &boundary_query, &accumulator,
+                       &tau_before, &expanded_count, &misses,
+                       no_improve_patience, FNAME]
+                          (auto &candidates, auto &scan_one) {
                       return trans_intr::do_for_each(candidates, scan_one
-                      ).si_then([this, &t, &accumulator, &tau_before,
-                                 &expanded_count, FNAME] {
+                      ).si_then([this, &t, &boundary_query, &accumulator,
+                                 &tau_before, &expanded_count, &misses,
+                                 no_improve_patience, FNAME] {
                         auto tau_after = accumulator.current_tau();
                         const bool improved =
                           ceph::rados::vector_query_exec::tree_boundary_tau_improved(
                             tau_before, tau_after);
                         if (!improved) {
+                          ++misses;
+                          if (misses <= no_improve_patience) {
+                            return seastar::stop_iteration::no;
+                          }
                           DEBUGT("tree_boundary_search: stop, additional subtree "
                                  "did not improve top-k (expanded={})",
                                  t, expanded_count);
                           return seastar::stop_iteration::yes;
                         }
+                        misses = 0;
                         return seastar::stop_iteration::no;
                       });
                     });
                   });
                 });
+              });
               });
             }).si_then([&accumulator, &result]
                 () -> base_iertr::future<> {
