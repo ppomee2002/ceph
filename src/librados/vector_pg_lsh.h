@@ -155,6 +155,10 @@ struct query_params_t {
   // Consecutive non-improving subtree expansions tolerated before the OSD
   // stops expanding a probe. 0 stops at the first one.
   uint32_t tree_boundary_search_no_improve_patience = 0;
+  // Max ONodes the OSD may open per probe; 0 is unlimited. Setting it
+  // makes the search approximate: it caps cost, it does not bound how
+  // much of the result set is missed.
+  uint32_t tree_boundary_search_onode_budget = 0;
   // Query-side PG selection and ordering. Changes which PGs a query
   // visits, never where a vector is stored, so it can be changed on an
   // index that is already populated.
@@ -1012,6 +1016,8 @@ inline void apply_tree_boundary_search_config(
   tree_boundary.enable_pruning = query_params.tree_boundary_search_prune;
   tree_boundary.no_improve_patience =
       query_params.tree_boundary_search_no_improve_patience;
+  tree_boundary.onode_budget =
+      query_params.tree_boundary_search_onode_budget;
   req->tree_boundary_search = std::move(tree_boundary);
 }
 
