@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <bitset>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -21,7 +20,6 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
-#include <queue>
 #include <random>
 #include <set>
 #include <sstream>
@@ -132,24 +130,6 @@ struct options_t {
   std::string selective_csv_path;
 };
 
-// "pivot" = farthest-first representatives (build_pivot_model()); "pivot-random"
-// = uniform-random representatives (build_pivot_model_random()). Both produce
-// the same PivotModel shape and share every downstream routing/query/recall
-// code path -- only representative selection differs.
-inline bool is_pivot_routing_mode(const std::string& routing_mode)
-{
-  return routing_mode == "pivot" || routing_mode == "pivot-random";
-}
-
-// "hyperplane" = boundary-distance best-first prototype, see the
-// HyperplaneModel/hyperplane_rank_pgs() block below. Independent of both
-// pg-lsh-v0 and the pivot modes; added purely for a probe-count-vs-recall
-// comparison experiment.
-inline bool is_hyperplane_routing_mode(const std::string& routing_mode)
-{
-  return routing_mode == "hyperplane";
-}
-
 struct float_dataset_t {
   uint32_t dimension = 0;
   std::vector<std::vector<float>> rows;
@@ -197,15 +177,8 @@ void usage(std::ostream& out, const char *program)
       << "Native VectorNode PG-LSH benchmark. MODE is pg-container or pg-suboid.\n"
       << "\n"
       << "Dataset: --base FILE --query FILE --groundtruth FILE\n"
-      << "Operation: --operation load|query|both|route-dry-run|fanout-query|diagnose"
+      << "Operation: --operation load|query|both|fanout-query"
       << " --base-limit N --query-limit N\n"
-      << "  route-dry-run: print index,pg for every loaded query row and exit;\n"
-      << "    no cluster connection is made.\n"
-      << "  diagnose: pure client-side routing/ground-truth-PG/address diagnostic\n"
-      << "    pass (JSONL to stdout, one row per (query, groundtruth top-k rank));\n"
-      << "    no cluster connection is made. Requires --groundtruth. --m sets the\n"
-      << "    routing-ranking budget (how many candidate PGs to rank per query,\n"
-      << "    not a fan-out to actually probe).\n"
       << "  --query-index-list FILE: use exactly these query-file row indices,\n"
       << "    in this order, instead of the first --query-limit rows.\n"
       << "  --destination-pg-log FILE: during the measured query run, record\n"
@@ -251,13 +224,6 @@ void usage(std::ostream& out, const char *program)
       << "  --tree-search-budget N --tree-prune: real tau-based subtree\n"
       << "    EXCLUSION (not just best-first reordering) within the tree\n"
       << "    search; requires --raw-euclidean-geometry.\n"
-      << "  routing-mode=hyperplane: boundary-distance best-first PROTOTYPE\n"
-      << "    (not paper-verified), recursive binary hyperplane space\n"
-      << "    partitioning for PUT PGID assignment. Requires --pg-num 1024;\n"
-      << "    --d selects the top-d best-first candidates to write to\n"
-      << "    (--d 1 = primary-only descent); reuses --seed and\n"
-      << "    --pivot-build-sample for the root pivot/scale model; --m\n"
-      << "    controls the query-side multi-probe budget.\n"
       << "Load: --load-concurrency N\n"
       << "Query: --top-k N --query-concurrency N --warmup-rounds N --rounds N\n"
       << "       --min-queries N --min-seconds N\n"
@@ -442,8 +408,7 @@ bool parse_options(int argc, char **argv, options_t *options)
     return false;
   }
   if (options->operation != "load" && options->operation != "query" &&
-      options->operation != "both" && options->operation != "route-dry-run" &&
-      options->operation != "fanout-query" && options->operation != "diagnose") {
+      options->operation != "both" && options->operation != "fanout-query") {
     return false;
   }
   if (options->operation == "fanout-query" &&
@@ -452,9 +417,7 @@ bool parse_options(int argc, char **argv, options_t *options)
   }
   if (options->routing_mode != "pg-container" &&
       options->routing_mode != "pg-suboid" &&
-      options->routing_mode != "pivot" &&
-      options->routing_mode != "pivot-random" &&
-      options->routing_mode != "hyperplane") {
+      options->routing_mode != "pivot") {
     return false;
   }
   if (options->operation != "load" && options->query_path.empty()) {
@@ -466,28 +429,17 @@ bool parse_options(int argc, char **argv, options_t *options)
   if (options->pg_num == 0 ||
       (options->pg_num & (options->pg_num - 1)) != 0 ||
       options->d == 0 || options->d > options->pg_num ||
-      (options->operation != "fanout-query" &&
-       options->operation != "route-dry-run" &&
-       options->operation != "diagnose" && options->m != 1) ||
-      ((options->operation == "fanout-query" ||
-        options->operation == "route-dry-run" ||
-        options->operation == "diagnose") &&
+      (options->operation != "fanout-query" && options->m != 1) ||
+      (options->operation == "fanout-query" &&
        (options->m == 0 || options->m > options->pg_num)) ||
       options->hamming_radius > options->k) {
     return false;
   }
-  // hyperplane's PGID assignment is only defined for L=log2(pg_num)=10.
-  // --d>1 writes to the top-d candidates of the vector's own descent, the
-  // same ranking function queries use.
-  if (options->routing_mode == "hyperplane" && options->pg_num != 1024) {
-    return false;
-  }
   if (options->routing_mode == "pg-container" ||
-      is_pivot_routing_mode(options->routing_mode) ||
-      options->routing_mode == "hyperplane") {
-    // All three are one-object-per-PG (no sub-OID filtering): pivot/
-    // hyperplane routing only changes which PG a vector lands in, not the
-    // in-PG storage layout.
+      options->routing_mode == "pivot") {
+    // Both are one-object-per-PG (no sub-OID filtering): pivot routing
+    // only changes which PG a vector lands in, not the in-PG storage
+    // layout.
     if (options->residual_bits != 0 || options->probe_limit_per_pg != 0 ||
         options->distance_bucket_bits != 0 ||
         options->distance_bucket_radius != 0 ||
@@ -500,7 +452,7 @@ bool parse_options(int argc, char **argv, options_t *options)
     // effects in a microbenchmark. 4 stays the default.
     return false;
   }
-  if (is_pivot_routing_mode(options->routing_mode) &&
+  if (options->routing_mode == "pivot" &&
       options->pivot_probe_budget == 0) {
     return false;
   }
@@ -555,10 +507,7 @@ bool parse_options(int argc, char **argv, options_t *options)
       return false;
     }
   }
-  // hyperplane reuses --pivot-build-sample for its own model-building
-  // sample size (root pivot p_0 / scale S), same as routing-mode=pivot.
-  if ((options->routing_mode == "pivot" ||
-       options->routing_mode == "hyperplane") &&
+  if (options->routing_mode == "pivot" &&
       options->pivot_build_sample == 0) {
     return false;
   }
@@ -856,8 +805,7 @@ bool validate_oid(const options_t& options,
   if (pg_pos == std::string::npos) return false;
   const auto after_pg = oid.find('/', pg_pos + 1);
   if (options.routing_mode == "pg-container" ||
-      is_pivot_routing_mode(options.routing_mode) ||
-      is_hyperplane_routing_mode(options.routing_mode)) {
+      options.routing_mode == "pivot") {
     return sub_oid.empty() && after_pg == std::string::npos;
   }
   return !sub_oid.empty() && after_pg != std::string::npos &&
@@ -962,36 +910,6 @@ PivotModel build_pivot_model(const float_dataset_t& base,
   return model;
 }
 
-// routing-mode=pivot-random: representatives are pg_num base vectors drawn
-// uniformly without replacement, a baseline for the farthest-first "pivot"
-// mode above. Reuses --seed, and draws with a partial Fisher-Yates over the
-// row indices.
-PivotModel build_pivot_model_random(const float_dataset_t& base,
-                                    uint32_t pg_num, uint32_t seed)
-{
-  PivotModel model;
-  model.dim = static_cast<int>(base.dimension);
-  if (base.rows.empty() || pg_num == 0 || base.dimension == 0) {
-    return model;
-  }
-
-  const size_t pivot_count = std::min<size_t>(pg_num, base.rows.size());
-  std::vector<size_t> indices(base.rows.size());
-  std::iota(indices.begin(), indices.end(), 0);
-  std::mt19937_64 rng(seed);
-  for (size_t i = 0; i < pivot_count; ++i) {
-    std::uniform_int_distribution<size_t> dist(i, indices.size() - 1);
-    std::swap(indices[i], indices[dist(rng)]);
-  }
-
-  model.sample_count = pivot_count;
-  model.reps.reserve(pivot_count);
-  for (size_t i = 0; i < pivot_count; ++i) {
-    model.reps.push_back(base.rows[indices[i]]);
-  }
-  return model;
-}
-
 // Ranks every representative by squared L2 distance to `vec` and returns up
 // to `keep_n` PG ids, nearest first (keep_n is pivot_probe_budget; callers
 // further slice the first --d (write) or --m (probe) of the result). Ties
@@ -1075,233 +993,6 @@ int pivot_query_probes(const options_t& options,
   return 0;
 }
 
-// ---------------------------------------------------------------------
-// routing-mode=hyperplane: boundary-distance best-first probe ordering,
-// an experiment for probe-count-vs-recall comparison against LSH and
-// FF-pivot. The PGID rule is a recursive binary space partitioning:
-//
-//   h_R    = PRNG(Hash(R)) / ||PRNG(Hash(R))||_2      (unit hyperplane normal)
-//   b_R    = 0 if (v - p_R)*h_R < 0 else 1             (split side)
-//   delta_l = S / 2^(l+1)                              (child pivot step)
-//   p_R^b  = p_R + (2*b_R - 1) * delta_l * h_R          (child pivot)
-//   PGID(v) = b_1 b_2 ... b_L                           (leaf id, L levels)
-//
-// p_root is a single global anchor derived from the dataset, and
-// rho_l == delta_l == S / 2^(l+1).
-//
-// Only pg_num == 1024 (L == 10) is supported; PGID is used directly as the
-// PG id with no secondary hash, so the binary path keeps its locality.
-// Multi-probe beyond the primary leaf is the boundary-margin heuristic in
-// hyperplane_rank_pgs().
-// ---------------------------------------------------------------------
-
-struct HyperplaneModel {
-  int dim = 0;
-  uint32_t seed = 0;
-  std::vector<float> root_pivot;    // p_0: dataset centroid (the "global anchor")
-  float scale = 0.0f;               // S: max per-coordinate deviation from p_0
-  static constexpr uint32_t L = 10; // log2(1024); hardcoded, not generalized yet
-};
-
-// p_0 and S are external parameters of the partitioning formulas, derived
-// here from data: p_0 is the coordinate-wise mean of a strided --base
-// sample and S the largest absolute per-coordinate deviation from it in
-// that sample. Sample size comes from --pivot-build-sample.
-HyperplaneModel build_hyperplane_model(const float_dataset_t& base,
-                                       uint32_t seed,
-                                       uint32_t build_sample)
-{
-  HyperplaneModel model;
-  model.dim = static_cast<int>(base.dimension);
-  model.seed = seed;
-  if (base.rows.empty() || base.dimension == 0) {
-    return model;
-  }
-
-  const size_t vector_count = base.rows.size();
-  const size_t sample_limit = std::min<size_t>(
-      vector_count, std::max<size_t>(1, build_sample));
-  const size_t stride = std::max<size_t>(1, vector_count / sample_limit);
-  std::vector<const std::vector<float> *> samples;
-  samples.reserve(sample_limit);
-  for (size_t i = 0; i < vector_count && samples.size() < sample_limit;
-       i += stride) {
-    samples.push_back(&base.rows[i]);
-  }
-  if (samples.empty()) {
-    return model;
-  }
-
-  model.root_pivot.assign(model.dim, 0.0f);
-  for (const auto *sample : samples) {
-    for (int d = 0; d < model.dim; ++d) {
-      model.root_pivot[d] += (*sample)[d];
-    }
-  }
-  for (int d = 0; d < model.dim; ++d) {
-    model.root_pivot[d] /= static_cast<float>(samples.size());
-  }
-
-  float max_dev = 0.0f;
-  for (const auto *sample : samples) {
-    for (int d = 0; d < model.dim; ++d) {
-      max_dev = std::max(max_dev, std::abs((*sample)[d] - model.root_pivot[d]));
-    }
-  }
-  model.scale = max_dev;
-  return model;
-}
-
-inline float boundary_score(const float *v, const std::vector<float>& pivot,
-                            const std::vector<float>& h, int dim)
-{
-  float sum = 0.0f;
-  for (int d = 0; d < dim; ++d) {
-    sum += (v[d] - pivot[d]) * h[d];
-  }
-  return sum;
-}
-
-inline uint64_t splitmix64_next(uint64_t& state)
-{
-  uint64_t z = (state += 0x9E3779B97F4A7C15ULL);
-  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-  return z ^ (z >> 31);
-}
-
-// R packed as one integer with a leading guard bit (1-indexed complete
-// binary tree numbering: root=1, children 2,3, ...), built as
-// region_id = (region_id << 1) | b per decision. That keeps it injective
-// across path lengths, e.g. R="1" -> 3, R="01" -> 5, R="001" -> 9. L<=10
-// keeps region_id below 2^11, clear of the dim field below.
-
-// Deterministic h_R = PRNG(Hash(R)) / ||PRNG(Hash(R))||_2 for region R,
-// where Hash(R) is keyed directly by the region_id above. Recomputed on
-// every call, never stored -- mirrors pg_lsh_v0's existing "reseed and
-// recompute" style (pg_lsh_v0_hyperplane_sign() in vector_placement.h) so
-// PUT and QUERY always agree without persisting any hyperplane state.
-void hyperplane_region_h(uint32_t seed, uint32_t region_id,
-                         int dim, std::vector<float> *out)
-{
-  static constexpr double kTwoPi = 6.283185307179586476925286766559;
-  out->assign(dim, 0.0f);
-  double norm_sq = 0.0;
-  for (int d = 0; d < dim; ++d) {
-    uint64_t state = (uint64_t{seed} << 32) ^ (uint64_t{region_id} << 16) ^
-      static_cast<uint32_t>(d);
-    state ^= 0xD1B54A32D192ED03ULL;  // hyperplane-tree domain separator
-    splitmix64_next(state);          // warm up so seed=0 isn't degenerate
-    const uint64_t r1 = splitmix64_next(state);
-    const uint64_t r2 = splitmix64_next(state);
-    const double u1 = (static_cast<double>(r1 >> 11) + 0.5) *
-      (1.0 / 9007199254740992.0);    // (0,1)
-    const double u2 = (static_cast<double>(r2 >> 11) + 0.5) *
-      (1.0 / 9007199254740992.0);    // (0,1)
-    const double g = std::sqrt(-2.0 * std::log(u1)) * std::cos(kTwoPi * u2);
-    (*out)[d] = static_cast<float>(g);
-    norm_sq += g * g;
-  }
-  const double inv_norm = norm_sq > 0.0 ? 1.0 / std::sqrt(norm_sq) : 0.0;
-  for (int d = 0; d < dim; ++d) {
-    (*out)[d] = static_cast<float>((*out)[d] * inv_norm);
-  }
-}
-
-// A deferred candidate subtree: `pivot` is p_R at `filled_level` (ready to
-// resume descent), `margin` is the |(q-p_R)*h_R| recorded at the branch
-// point where this candidate diverged from its parent's primary path.
-// `region_id` is R itself (see hyperplane_region_h() comment above).
-struct HyperplaneBranch {
-  uint32_t region_id = 1;
-  uint32_t filled_level = 0;
-  float margin = 0.0f;
-  std::vector<float> pivot;
-};
-
-struct HyperplaneBranchGreater {
-  bool operator()(const HyperplaneBranch& a, const HyperplaneBranch& b) const
-  {
-    return a.margin > b.margin;  // smaller margin pops first (min-heap)
-  }
-};
-
-// Boundary-distance best-first ordering. Descends the primary (b_R) side
-// from the root, pushing each level's sibling onto a min-margin priority
-// queue. Popping a candidate resumes a primary descent from its branch
-// point down to a leaf, until `m` leaves are collected or the queue empties.
-// Distinct candidates always resolve to distinct leaves, since the region
-// tree partitions them; the bitset below is only a safety net.
-std::vector<uint32_t> hyperplane_rank_pgs(const float *query,
-                                          const HyperplaneModel& model,
-                                          uint32_t m)
-{
-  std::vector<uint32_t> out;
-  if (model.dim == 0 || m == 0 || model.root_pivot.empty()) {
-    return out;
-  }
-  const uint32_t pg_num = 1u << HyperplaneModel::L;
-  m = std::min(m, pg_num);
-
-  std::priority_queue<HyperplaneBranch, std::vector<HyperplaneBranch>,
-                      HyperplaneBranchGreater> heap;
-  heap.push({1, 0, -1.0f, model.root_pivot});
-
-  std::bitset<(1u << HyperplaneModel::L)> seen;
-  std::vector<float> h;
-  out.reserve(m);
-
-  while (!heap.empty() && out.size() < m) {
-    HyperplaneBranch entry = heap.top();
-    heap.pop();
-    uint32_t region_id = entry.region_id;
-    std::vector<float> pivot = std::move(entry.pivot);
-    for (uint32_t level = entry.filled_level; level < HyperplaneModel::L; ++level) {
-      hyperplane_region_h(model.seed, region_id, model.dim, &h);
-      const float s = boundary_score(query, pivot, h, model.dim);
-      const uint32_t b = s < 0.0f ? 0u : 1u;
-      const float margin = std::abs(s);
-      const float delta = model.scale / static_cast<float>(2u << level);
-      const float sign = 2.0f * static_cast<float>(b) - 1.0f;
-
-      HyperplaneBranch alt;
-      alt.region_id = (region_id << 1) | (1u - b);
-      alt.filled_level = level + 1;
-      alt.margin = margin;
-      alt.pivot.resize(model.dim);
-      for (int d = 0; d < model.dim; ++d) {
-        alt.pivot[d] = pivot[d] - sign * delta * h[d];
-      }
-      heap.push(std::move(alt));
-
-      for (int d = 0; d < model.dim; ++d) {
-        pivot[d] += sign * delta * h[d];
-      }
-      region_id = (region_id << 1) | b;
-    }
-    // Strip the guard bit: the low L bits of region_id are exactly
-    // b_0 b_1 ... b_(L-1) in chronological order, i.e. PGID(v) itself.
-    const uint32_t pg = region_id & (pg_num - 1);
-    if (!seen.test(pg)) {
-      seen.set(pg);
-      out.push_back(pg);
-    }
-  }
-  return out;
-}
-
-// PUT-time PGID assignment: --d=1 is the primary-only descent (never pops
-// an alternate); --d>1 writes to the top-d best-first candidates from the
-// vector's own descent, using the exact same boundary-margin ranking as
-// QUERY (hyperplane_rank_pgs()) -- symmetric with how pg_lsh_v0/pivot
-// already turn their own ranking functions' top-d into write targets.
-std::vector<uint32_t> hyperplane_write_pgs(const float *v,
-                                           const HyperplaneModel& model,
-                                           uint32_t d)
-{
-  return hyperplane_rank_pgs(v, model, d);
-}
-
 // Sequential at load_concurrency=1. Each worker owns its IoCtx and
 // locator_cache and shares the precomputed locator_state; rows are handed
 // out by an atomic ticket counter, so above concurrency 1 the row that
@@ -1312,8 +1003,7 @@ load_result_t load_vectors(const options_t& options,
                            librados::Rados& cluster,
                            std::shared_ptr<pg_lsh::locator_state_t> locator_state,
                            const pg_lsh::index_config_t& config,
-                           const PivotModel *pivot_model = nullptr,
-                           const HyperplaneModel *hyperplane_model = nullptr)
+                           const PivotModel *pivot_model = nullptr)
 {
   load_result_t result;
   const auto begin = clock_type::now();
@@ -1362,20 +1052,13 @@ load_result_t load_vectors(const options_t& options,
         const auto vector_bl = vector_buffer(base.rows[row]);
         std::vector<pg_lsh::put_target_t> targets;
         int pr;
-        if (is_pivot_routing_mode(options.routing_mode)) {
+        if (options.routing_mode == "pivot") {
           const auto ranked = pivot_rank_pgs(
               base.rows[row].data(), pivot_model->dim, *pivot_model,
               options.pivot_probe_budget);
           std::vector<uint32_t> write_pgs(
               ranked.begin(),
               ranked.begin() + std::min<size_t>(options.d, ranked.size()));
-          pr = pivot_put_targets(
-              options, vector_bl, write_pgs, &locator_cache, &targets);
-        } else if (is_hyperplane_routing_mode(options.routing_mode)) {
-          // Top-d best-first candidates from this vector's own descent;
-          // reuses pivot_put_targets() since it only needs a PG list.
-          const auto write_pgs = hyperplane_write_pgs(
-              base.rows[row].data(), *hyperplane_model, options.d);
           pr = pivot_put_targets(
               options, vector_bl, write_pgs, &locator_cache, &targets);
         } else {
@@ -1482,8 +1165,7 @@ bool sorted_distances(const std::vector<ceph::rados::query_vectors_result_entry_
 
 // --destination-pg-log verification sink: records which real PG each of
 // the first `cap` requests actually resolved to, so a curated
-// --query-index-list workload's PG-fanout can be proven from the live run
-// rather than only from the offline route-dry-run computation.
+// --query-index-list workload's PG-fanout can be proven from the live run.
 struct dest_pg_log_t {
   std::mutex lock;
   std::ofstream out;
@@ -1777,8 +1459,7 @@ fanout_query_result_t run_fanout_queries(
     std::ofstream *fanout_log,
     const sf::policy_t& policy,
     std::ofstream *selective_csv = nullptr,
-    const PivotModel *pivot_model = nullptr,
-    const HyperplaneModel *hyperplane_model = nullptr)
+    const PivotModel *pivot_model = nullptr)
 {
   fanout_query_result_t result;
   const uint64_t fixed_total =
@@ -1841,21 +1522,13 @@ fanout_query_result_t run_fanout_queries(
 
         std::vector<pg_lsh::query_probe_t> probes;
         uint64_t generated_groups = 0;
-        if (is_pivot_routing_mode(options.routing_mode)) {
+        if (options.routing_mode == "pivot") {
           const auto ranked = pivot_rank_pgs(
               queries.rows[query_index].data(), pivot_model->dim,
               *pivot_model, options.pivot_probe_budget);
           std::vector<uint32_t> probe_pgs(
               ranked.begin(),
               ranked.begin() + std::min<size_t>(options.m, ranked.size()));
-          generated_groups = probe_pgs.size();
-          r = pivot_query_probes(options, probe_pgs, &cache, &probes);
-        } else if (is_hyperplane_routing_mode(options.routing_mode)) {
-          // Boundary-distance best-first prototype -- see the
-          // HyperplaneModel block above. Reuses pivot_query_probes() since
-          // it only needs a ranked PG list.
-          const auto probe_pgs = hyperplane_rank_pgs(
-              queries.rows[query_index].data(), *hyperplane_model, options.m);
           generated_groups = probe_pgs.size();
           r = pivot_query_probes(options, probe_pgs, &cache, &probes);
         } else {
@@ -2447,158 +2120,6 @@ int main(int argc, char **argv)
     }
   }
 
-  if (options.operation == "route-dry-run") {
-    // Pure client-side PG-LSH computation (config.anchor is derived only
-    // from dimension+seed, not from live data), so this needs no cluster
-    // connection at all -- used to build --query-index-list workloads that
-    // are proven, before ever touching the cluster, to route to exactly
-    // the destination PG set the caller wants.
-    const auto dry_run_config = requested_config(options, *base);
-    for (size_t index = 0; index < queries->rows.size(); ++index) {
-      const auto query_bl = vector_buffer(queries->rows[index]);
-      std::vector<librados::vector_placement::pg_lsh_v0_ranked_pg_t> ranked;
-      uint64_t generated_groups = 0;
-      const int dr = pg_lsh::select_query_pgs(
-          query_bl, dry_run_config, query_params(options), pool_info(options),
-          &ranked, &generated_groups);
-      if (dr < 0 || ranked.size() != 1) {
-        std::cerr << "error: route-dry-run index=" << index
-                  << " code=" << dr << " ranked=" << ranked.size() << '\n';
-        return 1;
-      }
-      std::cout << index << ',' << ranked.front().pg << '\n';
-    }
-    return 0;
-  }
-
-  if (options.operation == "diagnose") {
-    // Client-side pass, no cluster connection: for every query, rank the
-    // candidate PGs the way a real fan-out query would, then look up which
-    // PG each of that query's ground-truth ids was written to and where
-    // that PG landed in the ranking. Routing and sub_oid are pure
-    // functions of (vector, config), and config is recomputed from --base
-    // here, so this must run with the same options the pool was loaded
-    // with or the reproduced config diverges from what is stored.
-    if (!groundtruth) {
-      std::cerr << "error: diagnose requires --groundtruth\n";
-      return 2;
-    }
-    const auto diag_config = requested_config(options, *base);
-    auto ranking_params = query_params(options);
-    ranking_params.m = options.m;  // --m is the routing-ranking budget here
-    const bool sub_oid_on = librados::vector_placement::pg_lsh_v0::sub_oid_enabled(
-        diag_config.distance_bucket_bits, diag_config.residual_bits);
-
-    for (size_t qi = 0; qi < queries->rows.size(); ++qi) {
-      const auto query_bl = vector_buffer(queries->rows[qi]);
-      std::vector<librados::vector_placement::pg_lsh_v0_ranked_pg_t> ranked;
-      uint64_t generated_groups = 0;
-      const int rr = pg_lsh::select_query_pgs(
-          query_bl, diag_config, ranking_params, pool_info(options),
-          &ranked, &generated_groups);
-      if (rr < 0) {
-        std::cerr << "error: diagnose select_query_pgs index=" << qi
-                  << " code=" << rr << '\n';
-        return 1;
-      }
-      std::unordered_map<uint32_t, size_t> pg_rank;
-      pg_rank.reserve(ranked.size());
-      for (size_t i = 0; i < ranked.size(); ++i) pg_rank.emplace(ranked[i].pg, i);
-
-      // Per-query routing "score" histogram: how many candidate PGs land at
-      // each min_hamming_distance ("score"). Emitted once per query (not
-      // once per GT row) so a selective-fan-out policy can be evaluated
-      // against "how many PGs are this confidently routed" independent of
-      // any particular ground-truth id.
-      {
-        std::map<uint32_t, uint64_t> hd_histogram;
-        for (const auto& candidate : ranked) {
-          ++hd_histogram[candidate.min_hamming_distance];
-        }
-        uint64_t cumulative = 0;
-        uint32_t max_hd_seen = hd_histogram.empty() ? 0 : hd_histogram.rbegin()->first;
-        std::cout << "{\"type\":\"query_summary\",\"query_index\":" << qi
-                  << ",\"routing_ranking_size\":" << ranked.size()
-                  << ",\"score_le\":{";
-        for (uint32_t hd = 0; hd <= max_hd_seen; ++hd) {
-          const auto it = hd_histogram.find(hd);
-          if (it != hd_histogram.end()) cumulative += it->second;
-          if (hd != 0) std::cout << ',';
-          std::cout << '"' << hd << "\":" << cumulative;
-        }
-        std::cout << "}}\n";
-      }
-
-      librados::vector_placement::pg_lsh_v0::sub_oid_t query_sub_oid{};
-      bool have_query_sub_oid = false;
-      if (sub_oid_on) {
-        have_query_sub_oid =
-          pg_lsh::compute_sub_oid(query_bl, diag_config, &query_sub_oid) == 0;
-      }
-
-      if (qi >= groundtruth->rows.size()) continue;
-      const auto& truth = groundtruth->rows[qi];
-      const size_t truth_k = std::min<size_t>(options.top_k, truth.size());
-      for (size_t rank_index = 0; rank_index < truth_k; ++rank_index) {
-        const uint32_t gt_id = truth[rank_index];
-        std::cout << "{\"query_index\":" << qi
-                  << ",\"gt_rank\":" << (rank_index + 1)
-                  << ",\"gt_id\":" << gt_id;
-        if (gt_id >= base->rows.size()) {
-          std::cout << ",\"error\":\"gt_id_out_of_range\"}\n";
-          continue;
-        }
-        const auto gt_bl = vector_buffer(base->rows[gt_id]);
-        std::vector<uint32_t> write_pgs;
-        const int wr = pg_lsh::select_write_pgs(
-            gt_bl, diag_config, pool_info(options), &write_pgs);
-        const bool have_gt_pg = wr == 0 && !write_pgs.empty();
-        const uint32_t gt_pg = have_gt_pg ? write_pgs.front() : 0;
-
-        librados::vector_placement::pg_lsh_v0::sub_oid_t gt_sub_oid{};
-        bool have_gt_sub_oid = false;
-        if (sub_oid_on) {
-          have_gt_sub_oid =
-            pg_lsh::compute_sub_oid(gt_bl, diag_config, &gt_sub_oid) == 0;
-        }
-
-        std::cout << ",\"routed_pg_top1\":"
-                  << (ranked.empty() ? -1 : static_cast<int64_t>(ranked.front().pg))
-                  << ",\"routing_ranking_size\":" << ranked.size()
-                  << ",\"gt_pg\":" << (have_gt_pg ? static_cast<int64_t>(gt_pg) : -1);
-
-        const auto found = have_gt_pg ? pg_rank.find(gt_pg) : pg_rank.end();
-        if (found != pg_rank.end()) {
-          std::cout << ",\"gt_pg_routing_rank\":" << (found->second + 1)
-                    << ",\"gt_min_hamming_distance\":"
-                    << ranked[found->second].min_hamming_distance
-                    << ",\"gt_table_votes_ref_only\":"
-                    << ranked[found->second].table_votes;
-        } else {
-          std::cout << ",\"gt_pg_routing_rank\":null"
-                    << ",\"gt_min_hamming_distance\":null"
-                    << ",\"gt_table_votes_ref_only\":null";
-        }
-
-        if (have_query_sub_oid && have_gt_sub_oid) {
-          const int delta_bucket =
-            static_cast<int>(query_sub_oid.distance_bucket) -
-            static_cast<int>(gt_sub_oid.distance_bucket);
-          const unsigned residual_xor = static_cast<unsigned>(
-              query_sub_oid.residual_code ^ gt_sub_oid.residual_code);
-          std::cout << ",\"delta_distance_bucket\":" << std::abs(delta_bucket)
-                    << ",\"residual_hamming\":"
-                    << std::bitset<32>(residual_xor).count();
-        } else {
-          std::cout << ",\"delta_distance_bucket\":null"
-                    << ",\"residual_hamming\":null";
-        }
-        std::cout << "}\n";
-      }
-    }
-    return 0;
-  }
-
   librados::Rados cluster;
   int r = cluster.init2(options.client_name.c_str(),
                         options.cluster_name.c_str(), 0);
@@ -2619,11 +2140,10 @@ int main(int argc, char **argv)
 
   auto config = requested_config(options, *base);
   std::string invalid_field;
-  // routing-mode=pivot/pivot-random/hyperplane keep no server-side index
-  // config: the model is determined by --base, --pivot-build-sample,
-  // --pg-num and --seed, so every invocation recomputes the same one.
-  if (!is_pivot_routing_mode(options.routing_mode) &&
-      !is_hyperplane_routing_mode(options.routing_mode)) {
+  // routing-mode=pivot keeps no server-side index config: the model is
+  // determined by --base, --pivot-build-sample, --pg-num and --seed, so
+  // every invocation recomputes the same one.
+  if (options.routing_mode != "pivot") {
     if (options.operation == "load" || options.operation == "both") {
       r = pg_lsh::create_index(ioctx, options.bucket, options.index,
                                config, pool_info(options), &invalid_field);
@@ -2646,8 +2166,6 @@ int main(int argc, char **argv)
   std::optional<PivotModel> pivot_model;
   if (options.routing_mode == "pivot") {
     pivot_model = build_pivot_model(*base, options.pg_num, options.pivot_build_sample);
-  } else if (options.routing_mode == "pivot-random") {
-    pivot_model = build_pivot_model_random(*base, options.pg_num, options.seed);
   }
   if (pivot_model) {
     std::cout << "PIVOT_MODEL mode=" << options.routing_mode
@@ -2662,28 +2180,6 @@ int main(int argc, char **argv)
     }
   }
   const PivotModel *pivot_model_ptr = pivot_model ? &*pivot_model : nullptr;
-
-  std::optional<HyperplaneModel> hyperplane_model;
-  if (options.routing_mode == "hyperplane") {
-    hyperplane_model = build_hyperplane_model(
-        *base, options.seed, options.pivot_build_sample);
-    std::cout << "HYPERPLANE_MODEL mode=boundary-distance-best-first-prototype"
-              << " seed=" << options.seed
-              << " levels=" << HyperplaneModel::L
-              << " dim=" << hyperplane_model->dim
-              << " scale=" << hyperplane_model->scale << '\n';
-    if (hyperplane_model->dim == 0 ||
-        hyperplane_model->root_pivot.size() !=
-          static_cast<size_t>(hyperplane_model->dim) ||
-        hyperplane_model->scale <= 0.0f) {
-      std::cerr << "error: hyperplane model build failed (dim="
-                << hyperplane_model->dim
-                << " scale=" << hyperplane_model->scale << ")\n";
-      return 1;
-    }
-  }
-  const HyperplaneModel *hyperplane_model_ptr =
-    hyperplane_model ? &*hyperplane_model : nullptr;
 
   auto locator_state = std::make_shared<pg_lsh::locator_state_t>();
   pg_lsh::locator_cache_t locator_cache(
@@ -2708,8 +2204,7 @@ int main(int argc, char **argv)
 
   if (options.operation == "load" || options.operation == "both") {
     const auto loaded = load_vectors(
-        options, *base, cluster, locator_state, config, pivot_model_ptr,
-        hyperplane_model_ptr);
+        options, *base, cluster, locator_state, config, pivot_model_ptr);
     print_load_result(loaded);
     if (loaded.failures != 0 || loaded.completed != base->rows.size()) return 1;
   }
@@ -2788,7 +2283,7 @@ int main(int argc, char **argv)
       const auto warmup = run_fanout_queries(
           options, *queries, nullptr, config, cluster, locator_state,
           options.warmup_rounds, 0, 0, false, nullptr, policy, nullptr,
-          pivot_model_ptr, hyperplane_model_ptr);
+          pivot_model_ptr);
       std::cout << "WARMUP completed=" << warmup.completed
                 << " failures=" << warmup.failures
                 << " missing_objects=" << warmup.missing_objects << '\n';
@@ -2798,7 +2293,7 @@ int main(int argc, char **argv)
         options, *queries, groundtruth ? &*groundtruth : nullptr,
         config, cluster, locator_state, options.rounds,
         options.min_queries, options.min_seconds, true, fanout_log_ptr,
-        policy, selective_csv_ptr, pivot_model_ptr, hyperplane_model_ptr);
+        policy, selective_csv_ptr, pivot_model_ptr);
     print_fanout_result(options, measured);
     if (measured.failures != 0) return 1;
   }
