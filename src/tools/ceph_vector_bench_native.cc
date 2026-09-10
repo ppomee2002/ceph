@@ -1416,6 +1416,7 @@ struct fanout_query_result_t {
   uint64_t tree_expanded_subtree_count = 0;
   uint64_t tree_pruned_distance_count = 0;
   uint64_t tree_pruned_residual_count = 0;
+  uint64_t tree_containment_violations = 0;
   uint64_t tree_opened_onode_count = 0;
   uint64_t tree_candidates_seen = 0;
   // Selective fan-out (--selective). final_m is the cumulative PG count the
@@ -1730,6 +1731,7 @@ fanout_query_result_t run_fanout_queries(
               local.tree_expanded_subtree_count += ts.expanded_subtree_count;
               local.tree_pruned_distance_count += ts.pruned_distance_count;
               local.tree_pruned_residual_count += ts.pruned_residual_count;
+              local.tree_containment_violations += ts.containment_violations;
               local.tree_opened_onode_count += ts.opened_onode_count;
               local.tree_candidates_seen += ts.candidates_seen;
             }
@@ -1902,6 +1904,7 @@ fanout_query_result_t run_fanout_queries(
     result.tree_expanded_subtree_count += local.tree_expanded_subtree_count;
     result.tree_pruned_distance_count += local.tree_pruned_distance_count;
     result.tree_pruned_residual_count += local.tree_pruned_residual_count;
+    result.tree_containment_violations += local.tree_containment_violations;
     result.tree_opened_onode_count += local.tree_opened_onode_count;
     result.tree_candidates_seen += local.tree_candidates_seen;
     result.selective_final_m_sum += local.selective_final_m_sum;
@@ -1979,6 +1982,8 @@ void print_fanout_result(const options_t& options, const fanout_query_result_t& 
         << average(result.tree_pruned_distance_count, result.completed)
         << " tree_pruned_residual_per_query="
         << average(result.tree_pruned_residual_count, result.completed)
+        << " tree_containment_violations="
+        << result.tree_containment_violations
         << " tree_opened_onodes_per_query="
         << average(result.tree_opened_onode_count, result.completed)
         << " tree_candidates_seen_per_query="
