@@ -63,6 +63,15 @@ struct options_t {
   uint32_t l = 16;
   uint32_t seed = 1315423911U;
   uint32_t d = 1;
+  // Load path only, and a post-filter on the already-built target list
+  // rather than a change to any routing function. Both routings build
+  // their write targets as a prefix of a d-independent ranking, so
+  // targets(d=D) is targets(d=D-1) plus one more entry. Writing only ranks
+  // [begin, d) therefore reproduces exactly the store state a full --d D
+  // load would have produced, given ranks [0, begin) are already present
+  // from an earlier load -- which is how a d=1 index is grown to d=2/d=3
+  // without re-PUTting the copies it already holds.
+  uint32_t write_rank_begin = 0;
   uint32_t m = 1;
   uint32_t hamming_radius = 0;
   uint32_t distance_bucket_bits = 0;
@@ -151,6 +160,11 @@ struct load_result_t {
   uint64_t completed = 0;
   uint64_t failures = 0;
   uint64_t put_targets = 0;
+  // Rows whose target list --write-rank-begin consumed whole: the routing
+  // produced fewer than begin+1 unique PGs for this vector, so a full load
+  // would also have written it fewer times and there is no rank-`begin`
+  // copy to add. Skipping it is what keeps the two equivalent.
+  uint64_t rank_skipped = 0;
   uint64_t target_violations = 0;
   int first_error = 0;
   double seconds = 0;
@@ -237,7 +251,10 @@ void usage(std::ostream& out, const char *program)
       << "    (default 0: stop at the first one).\n"
       << "  --tree-search-budget N --tree-onode-budget N: cap the ONodes the\n"
       << "    OSD opens per probe (default 0: unlimited).\n"
-      << "Load: --load-concurrency N\n"
+      << "Load: --load-concurrency N --write-rank-begin R\n"
+      << "    --write-rank-begin R writes only write-target ranks\n"
+      << "    [R, --d), growing an index loaded at --d R to --d D\n"
+      << "    without re-PUTting the copies it already holds.\n"
       << "Query: --top-k N --query-concurrency N --warmup-rounds N --rounds N\n"
       << "       --min-queries N --min-seconds N\n"
       << "Ceph: --conf FILE --client NAME --cluster NAME\n";
@@ -270,7 +287,8 @@ bool parse_options(int argc, char **argv, options_t *options)
     OPT_RESIDUAL_BITS, OPT_DISTANCE_BUCKET_RADIUS,
     OPT_RESIDUAL_HAMMING_RADIUS, OPT_PROBE_LIMIT_PER_PG,
     OPT_PIVOT_BUILD_SAMPLE, OPT_PIVOT_PROBE_BUDGET, OPT_TOP_K,
-    OPT_QUERY_CONCURRENCY, OPT_LOAD_CONCURRENCY, OPT_WARMUP_ROUNDS, OPT_ROUNDS, OPT_MIN_QUERIES,
+    OPT_QUERY_CONCURRENCY, OPT_LOAD_CONCURRENCY, OPT_WRITE_RANK_BEGIN,
+    OPT_WARMUP_ROUNDS, OPT_ROUNDS, OPT_MIN_QUERIES,
     OPT_MIN_SECONDS, OPT_BASE_LIMIT, OPT_QUERY_LIMIT,
     OPT_QUERY_INDEX_LIST, OPT_DESTINATION_PG_LOG,
     OPT_FANOUT_MODE, OPT_FANOUT_LOG, OPT_FANOUT_LOG_COUNT,
@@ -311,6 +329,7 @@ bool parse_options(int argc, char **argv, options_t *options)
     {"top-k", required_argument, nullptr, OPT_TOP_K},
     {"query-concurrency", required_argument, nullptr, OPT_QUERY_CONCURRENCY},
     {"load-concurrency", required_argument, nullptr, OPT_LOAD_CONCURRENCY},
+    {"write-rank-begin", required_argument, nullptr, OPT_WRITE_RANK_BEGIN},
     {"warmup-rounds", required_argument, nullptr, OPT_WARMUP_ROUNDS},
     {"rounds", required_argument, nullptr, OPT_ROUNDS},
     {"min-queries", required_argument, nullptr, OPT_MIN_QUERIES},
@@ -379,6 +398,7 @@ bool parse_options(int argc, char **argv, options_t *options)
     case OPT_TOP_K: PARSE_OPT(top_k); break;
     case OPT_QUERY_CONCURRENCY: PARSE_OPT(query_concurrency); break;
     case OPT_LOAD_CONCURRENCY: PARSE_OPT(load_concurrency); break;
+    case OPT_WRITE_RANK_BEGIN: PARSE_OPT(write_rank_begin); break;
     case OPT_WARMUP_ROUNDS: PARSE_OPT(warmup_rounds); break;
     case OPT_ROUNDS: PARSE_OPT(rounds); break;
     case OPT_QUERY_TABLE_COUNT: PARSE_OPT(query_table_count); break;
@@ -475,6 +495,19 @@ bool parse_options(int argc, char **argv, options_t *options)
   if (options->routing_mode == "pivot" &&
       options->pivot_probe_budget == 0) {
     return false;
+  }
+  // [begin, d) has to be a non-empty range, and any other operation would
+  // silently ignore the option.
+  if (options->write_rank_begin > 0) {
+    if (options->write_rank_begin >= options->d) {
+      std::cerr << "error: --write-rank-begin must be < --d\n";
+      return false;
+    }
+    if (options->operation != "load") {
+      std::cerr << "error: --write-rank-begin is only valid with"
+                   " --operation load\n";
+      return false;
+    }
   }
   // Boundary-aware search only exists for pg-suboid's sub_oid key space
   // (see common/vector_pg_lsh_boundary.h).
@@ -1089,6 +1122,16 @@ load_result_t load_vectors(const options_t& options,
               options.bucket, options.index, vector_bl, config,
               pool_info(options), &locator_cache, &targets);
         }
+        if (options.write_rank_begin > 0 && pr >= 0) {
+          if (options.write_rank_begin >= targets.size()) {
+            targets.clear();
+            ++local.rank_skipped;
+            ++local.completed;
+            continue;
+          }
+          targets.erase(targets.begin(),
+                        targets.begin() + options.write_rank_begin);
+        }
         local.put_targets += targets.size();
         // d>1 write fanout: build_put_targets() already dedups to at most
         // config.d unique PGs, so fewer targets than requested (PG
@@ -1158,6 +1201,7 @@ load_result_t load_vectors(const options_t& options,
     result.completed += local.completed;
     result.failures += local.failures;
     result.put_targets += local.put_targets;
+    result.rank_skipped += local.rank_skipped;
     result.target_violations += local.target_violations;
     result.vector_oids.insert(local.vector_oids.begin(), local.vector_oids.end());
     if (result.first_oid.empty()) result.first_oid = local.first_oid;
@@ -2023,6 +2067,7 @@ void print_load_result(const load_result_t& result)
             << " seconds=" << result.seconds
             << " actual_put_targets_per_vector="
             << average(result.put_targets, result.completed + result.failures)
+            << " rank_skipped=" << result.rank_skipped
             << " target_violations=" << result.target_violations
             << " vector_object_count=" << result.vector_oids.size() << '\n'
             << "PUT_OID_EXAMPLE " << result.first_oid << '\n';
