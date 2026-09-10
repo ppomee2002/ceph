@@ -91,6 +91,14 @@ struct options_t {
   // instead of the existing best-first-reordering-only behavior. Requires
   // --raw-euclidean-geometry and --tree-search-budget > 0.
   bool tree_prune = false;
+  // Tree-search-budget only: how many consecutive expansions that fail to
+  // narrow tau a probe may make before it stops
+  // (query_params_t::tree_boundary_search_no_improve_patience). 0 keeps the
+  // existing stop-on-first-non-improving-expansion behaviour.
+  uint32_t tree_no_improve_patience = 0;
+  // Tree-search-budget only: cap on ONodes the OSD may open per probe
+  // (query_params_t::tree_boundary_search_onode_budget). 0 is unlimited.
+  uint32_t tree_onode_budget = 0;
   // routing-mode=pivot only: see build_pivot_model()/pivot_rank_pgs() below.
   // write_top_pgs/probe_pgs reuse --d/--m (same "how many PGs" meaning as
   // LSH's write/query fanout).
@@ -224,6 +232,11 @@ void usage(std::ostream& out, const char *program)
       << "  --tree-search-budget N --tree-prune: real tau-based subtree\n"
       << "    EXCLUSION (not just best-first reordering) within the tree\n"
       << "    search; requires --raw-euclidean-geometry.\n"
+      << "  --tree-search-budget N --tree-no-improve-patience N: let a probe\n"
+      << "    survive N consecutive expansions that do not narrow tau\n"
+      << "    (default 0: stop at the first one).\n"
+      << "  --tree-search-budget N --tree-onode-budget N: cap the ONodes the\n"
+      << "    OSD opens per probe (default 0: unlimited).\n"
       << "Load: --load-concurrency N\n"
       << "Query: --top-k N --query-concurrency N --warmup-rounds N --rounds N\n"
       << "       --min-queries N --min-seconds N\n"
@@ -265,7 +278,8 @@ bool parse_options(int argc, char **argv, options_t *options)
     OPT_SELECTIVE, OPT_SELECTIVE_SCHEDULE, OPT_SELECTIVE_STOP,
     OPT_SELECTIVE_MIN_IMPROVEMENT, OPT_SELECTIVE_CSV,
     OPT_SERVER_SIDE_BOUNDARY_SEARCH, OPT_TREE_SEARCH_BUDGET,
-    OPT_RAW_EUCLIDEAN_GEOMETRY, OPT_TREE_PRUNE, OPT_HELP,
+    OPT_RAW_EUCLIDEAN_GEOMETRY, OPT_TREE_PRUNE,
+    OPT_TREE_NO_IMPROVE_PATIENCE, OPT_TREE_ONODE_BUDGET, OPT_HELP,
   };
   const option long_options[] = {
     {"base", required_argument, nullptr, OPT_BASE},
@@ -323,6 +337,9 @@ bool parse_options(int argc, char **argv, options_t *options)
     {"raw-euclidean-geometry", no_argument, nullptr,
      OPT_RAW_EUCLIDEAN_GEOMETRY},
     {"tree-prune", no_argument, nullptr, OPT_TREE_PRUNE},
+    {"tree-no-improve-patience", required_argument, nullptr,
+     OPT_TREE_NO_IMPROVE_PATIENCE},
+    {"tree-onode-budget", required_argument, nullptr, OPT_TREE_ONODE_BUDGET},
     {"help", no_argument, nullptr, OPT_HELP},
     {nullptr, 0, nullptr, 0},
   };
@@ -370,6 +387,9 @@ bool parse_options(int argc, char **argv, options_t *options)
     case OPT_BASE_LIMIT: PARSE_OPT(base_limit); break;
     case OPT_QUERY_LIMIT: PARSE_OPT(query_limit); break;
     case OPT_TREE_SEARCH_BUDGET: PARSE_OPT(tree_search_budget); break;
+    case OPT_TREE_NO_IMPROVE_PATIENCE:
+      PARSE_OPT(tree_no_improve_patience); break;
+    case OPT_TREE_ONODE_BUDGET: PARSE_OPT(tree_onode_budget); break;
 #undef PARSE_OPT
     case OPT_QUERY_INDEX_LIST: options->query_index_list_path = optarg; break;
     case OPT_DESTINATION_PG_LOG: options->destination_pg_log_path = optarg; break;
@@ -792,6 +812,9 @@ pg_lsh::query_params_t query_params(const options_t& options)
   params.server_side_boundary_search = options.server_side_boundary_search;
   params.tree_boundary_search_budget = options.tree_search_budget;
   params.tree_boundary_search_prune = options.tree_prune;
+  params.tree_boundary_search_no_improve_patience =
+      options.tree_no_improve_patience;
+  params.tree_boundary_search_onode_budget = options.tree_onode_budget;
   params.query_routing.table_count = options.query_table_count;
   params.query_routing.margin_ordered_probes = options.margin_ordered_probes;
   return params;
